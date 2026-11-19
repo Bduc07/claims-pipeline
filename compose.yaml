@@ -1,0 +1,15 @@
+services:
+  airflow:
+    build: .
+    command: standalone
+    user: "${AIRFLOW_UID:-50000}:0"
+    environment:
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_USERS: "admin:admin"
+      CLAIMS_PIPELINE_DATA: /opt/airflow/data
+      CLAIMS_PIPELINE_HMAC_KEY: ${CLAIMS_PIPELINE_HMAC_KEY:-}
+      CLAIMS_PIPELINE_ALERT_WEBHOOK: ${CLAIMS_PIPELINE_ALERT_WEBHOOK:-}
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - "${CLAIMS_PIPELINE_HOST_DATA:-./data}:/opt/airflow/data"

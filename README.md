@@ -97,3 +97,55 @@ for the schema change, late file, and corrupted batch drills.
 Silver requires a keyed masking secret. Colab prompts for it in Step 4.
 See [SECURITY.md](SECURITY.md) for field handling, key setup, and the
 Snowflake loader and reporter grants.
+
+## Run with Airflow or one command
+
+Docker Compose runs a local Airflow service and Spark. The Airflow DAG
+runs bronze, silver, and local gold in order, retries each failed task
+once, and saves a JSON alert under `data/output/alerts` if the run fails.
+Set `CLAIMS_PIPELINE_ALERT_WEBHOOK` to enable optional Slack-compatible
+notifications. The UI listens on localhost.
+
+1. Put the batch CSVs in `data/landing/`, or set
+   `CLAIMS_PIPELINE_HOST_DATA` to an existing folder with a `landing/`
+   subfolder. Optional inputs are `reference/patients.csv`,
+   `reference/providers.csv`, and `reference/payer_transitions.csv`.
+   Add `expected_files.txt` to require specific filenames before ingestion.
+2. Set `CLAIMS_PIPELINE_HMAC_KEY` using the instructions in SECURITY.md.
+   On Linux, set `AIRFLOW_UID` to your user ID with
+   `export AIRFLOW_UID=$(id -u)` so the container can write to the data folder.
+3. Run `docker compose up --build`. Open `http://localhost:8080`
+   and trigger the `claims_pipeline` DAG. The development login is
+   `admin`, with the generated password stored in the Airflow container
+   at `/opt/airflow/simple_auth_manager_passwords.json.generated`.
+4. Check `output/gold/weekly_payments` inside your data folder for Parquet
+   results. Run `docker compose down` when finished.
+
+Use one runner at a time for a given data folder.
+
+For a one-command run using the same image and data folder:
+
+```sh
+docker compose run --build --rm airflow python -m src.claims_pipeline.pipeline
+```
+
+With Python, Java, and the Spark dependencies installed on Linux, the
+fallback also works directly:
+
+```sh
+python -m src.claims_pipeline.pipeline --data-root data
+```
+
+The local runner produces Parquet gold tables and the weekly payments
+report. Snowflake loading and the warehouse `MERGE` remain a separate
+manual workflow using the silver exports and `sql/gold_pipeline.sql`.
+
+### AWS deployment mapping
+
+The local path has no AWS dependency. For EMR Serverless, land CSVs in
+S3, submit a packaged Spark job with an execution role scoped to its
+input and output prefixes, and store run logs in S3. Replace local batch
+tracking and output publication with S3-backed implementations before
+deployment. The Snowflake extension would load S3 results through a
+storage integration and stage, then run the existing SQL merges. No AWS
+resources were created or EMR jobs executed for this project.
