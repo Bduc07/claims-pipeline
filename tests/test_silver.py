@@ -1,3 +1,4 @@
+import csv
 import hashlib
 from decimal import Decimal
 from pathlib import Path
@@ -62,6 +63,48 @@ def test_bronze_rows_reconcile_with_silver(spark):
     valid_transactions = sum(row.quarantine_reason is None for row in checked_transactions)
     assert (valid_transactions, rejected_transactions) == (2, 1)
     assert transactions.count() == valid_transactions + rejected_transactions
+
+
+def test_quarantine_matches_answer_key(spark, tmp_path):
+    answer_key = tmp_path / "answer_key.csv"
+    answer_key.write_text(
+        "batch_id,source_file,issue,detail\n"
+        "2026-01-05,claims_2026-01-05.csv,invalid_status,claim-2\n"
+        "2026-01-05,transactions_2026-01-05.csv,invalid_amount,txn-2\n",
+        encoding="utf-8",
+    )
+    reasons = {
+        "invalid_status": "invalid_claim_status",
+        "invalid_amount": TRANSACTION_AMOUNT_RULE,
+    }
+    with answer_key.open(encoding="utf-8", newline="") as source:
+        expected = sorted(
+            (row["source_file"], row["detail"], reasons[row["issue"]])
+            for row in csv.DictReader(source)
+            if row["issue"] in reasons
+        )
+
+    claims = spark.sql("""
+        SELECT *, 'claims_2026-01-05.csv' AS source_file FROM VALUES
+            ('claim-1', 'CLOSED'), ('claim-2', 'UNKNOWN')
+        AS claims (Id, STATUS1)
+    """)
+    transactions = spark.sql("""
+        SELECT *, 'transactions_2026-01-05.csv' AS source_file FROM VALUES
+            ('txn-1', 'CHARGE', '12.34'), ('txn-2', 'CHARGE', 'INVALID')
+        AS transactions (ID, TYPE, AMOUNT)
+    """)
+    settings = TransactionRuleSettings(("CHARGE", "TRANSFERIN"))
+    claim_results = clean_claims(claims).selectExpr(
+        "source_file", "Id AS record_id", "quarantine_reason"
+    )
+    transaction_results = clean_transactions(transactions, settings).selectExpr(
+        "source_file", "ID AS record_id", "quarantine_reason"
+    )
+    quarantined = claim_results.unionByName(transaction_results).filter(
+        "quarantine_reason IS NOT NULL"
+    )
+    assert sorted(tuple(row) for row in quarantined.collect()) == expected
 
 
 def test_missing_claim_ids_are_preserved_before_deduplication(spark):
