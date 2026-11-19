@@ -6,13 +6,14 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql.readwriter import DataFrameWriter
 
-from src.claims_pipeline.rules import TransactionRuleSettings
+from src.claims_pipeline.rules import ClaimRuleSettings, TransactionRuleSettings
 from src.claims_pipeline.silver import (
     TRANSACTION_AMOUNT_RULE,
     SilverBatchBlocked,
     clean_claims,
     clean_transactions,
     write_silver,
+    write_silver_batch,
 )
 
 
@@ -45,6 +46,58 @@ def test_silver_claims(spark, tmp_path):
     assert valid.PATIENTID == hashlib.sha256(b"patient-1").hexdigest()
     assert invalid.PATIENTID == valid.PATIENTID
     assert (invalid.Id, invalid.quarantine_reason) == ("claim-2", "invalid_claim_status")
+
+
+def test_missing_claim_ids_are_preserved_before_deduplication(spark):
+    claims = spark.sql("""
+        SELECT *, 'claims_week.csv' AS source_file FROM VALUES
+            ('claim-1', 'CLOSED'),
+            (NULL, 'CLOSED'),
+            (NULL, 'UNKNOWN'),
+            ('', 'CLOSED'),
+            ('   ', 'CLOSED')
+        AS claims (Id, STATUS1)
+    """)
+    checked = clean_claims(claims)
+    [valid] = checked.filter("quarantine_reason IS NULL").select("Id").collect()
+    assert valid.Id == "claim-1"
+    rejected = checked.filter("quarantine_reason IS NOT NULL").collect()
+    assert len(rejected) == 4
+    assert {row.quarantine_reason for row in rejected} == {"missing_claim_id"}
+    assert sum(row.Id is None for row in rejected) == 2
+
+
+@pytest.mark.parametrize("severity", ["warn", "block"])
+def test_missing_claim_id_severity_controls_publication(spark, tmp_path, monkeypatch, severity):
+    config = tmp_path / "claim_rules.yaml"
+    config.write_text(f"missing_claim_id:\n  severity: {severity}\n", encoding="utf-8")
+    claims = spark.sql("""
+        SELECT *, 'claims_week.csv' AS source_file, 'patient-1' AS PATIENTID
+        FROM VALUES
+            ('claim-1', 'CLOSED'), (NULL, 'CLOSED'), (NULL, 'CLOSED'),
+            ('', 'CLOSED'), ('   ', 'CLOSED')
+        AS claims (Id, STATUS1)
+    """)
+    transactions = spark.sql("""
+        SELECT 'patient-1' AS PATIENTID, cast(NULL AS STRING) AS quarantine_reason
+    """)
+    writes = []
+    monkeypatch.setattr(DataFrameWriter, "parquet", lambda self, path: writes.append(Path(path)))
+    args = (
+        clean_claims(claims),
+        transactions,
+        tmp_path,
+        ClaimRuleSettings.from_yaml(config),
+        TransactionRuleSettings(("CHARGE",)),
+    )
+    if severity == "block":
+        with pytest.raises(SilverBatchBlocked, match="4 row"):
+            write_silver_batch(*args)
+        assert writes == [tmp_path / "quarantine" / "claims", tmp_path / "dq_results"]
+    else:
+        assert write_silver_batch(*args) == {"claims": (1, 4), "transactions": (1, 0)}
+        assert tmp_path / "claims" in writes
+        assert tmp_path / "transactions" in writes
 
 
 def test_claim_eligibility_checks_date_and_primary_payer(spark):

@@ -8,10 +8,17 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
-from .rules import Rule, RuleEngine, Severity, TransactionRuleSettings
+from .rules import (
+    ClaimRuleSettings,
+    Rule,
+    RuleEngine,
+    Severity,
+    TransactionRuleSettings,
+)
 
 logger = logging.getLogger(__name__)
 TRANSACTION_AMOUNT_RULE = "invalid_or_missing_amount"
+MISSING_CLAIM_ID_RULE = "missing_claim_id"
 
 
 class SilverBatchBlocked(RuntimeError):
@@ -19,12 +26,16 @@ class SilverBatchBlocked(RuntimeError):
 
 
 def clean_claims(claims: DataFrame, coverage: DataFrame | None = None) -> DataFrame:
+    missing_id = F.coalesce(F.col("Id"), F.lit("")).rlike(r"^\s*$")
+    rejected = claims.filter(missing_id).withColumn(
+        "quarantine_reason", F.lit(MISSING_CLAIM_ID_RULE)
+    )
     order = Window.partitionBy("Id").orderBy(
         F.col("source_file").endswith("_resend.csv").cast("int"),
         F.col("source_file"),
     )
     checked = (
-        claims.withColumn("_rank", F.row_number().over(order))
+        claims.filter(~missing_id).withColumn("_rank", F.row_number().over(order))
         .filter(F.col("_rank") == 1)
         .drop("_rank")
         .withColumn(
@@ -35,8 +46,8 @@ def clean_claims(claims: DataFrame, coverage: DataFrame | None = None) -> DataFr
     if coverage is not None:
         from .eligibility import flag_uncovered_claims
 
-        return flag_uncovered_claims(checked, coverage)
-    return checked
+        checked = flag_uncovered_claims(checked, coverage)
+    return checked.unionByName(rejected)
 
 
 def clean_transactions(
@@ -67,9 +78,11 @@ def write_silver(
     invalid = masked.filter(F.col("quarantine_reason").isNotNull())
     rejected = invalid.count()
     invalid.write.mode("overwrite").parquet(f"{silver_path}/quarantine/{table}")
-    blocked = rejected > 0 and severity == "block"
+    failed = rejected
     if report_rule is not None:
         failed = invalid.filter(F.col("quarantine_reason") == report_rule).count()
+    blocked = failed > 0 and severity == "block"
+    if report_rule is not None:
         result = "blocked" if blocked else "warned" if failed else "passed"
         summary = checked.sparkSession.range(1).select(
             F.lit(str(uuid4())).alias("run_id"),
@@ -90,3 +103,26 @@ def write_silver(
         logger.warning("Continuing silver %s with %d quarantined row(s)", table, rejected)
     valid.write.mode("overwrite").parquet(f"{silver_path}/{table}")
     return valid.count(), rejected
+
+
+def write_silver_batch(
+    claims: DataFrame,
+    transactions: DataFrame,
+    silver_path: str | Path,
+    claim_settings: ClaimRuleSettings,
+    transaction_settings: TransactionRuleSettings,
+) -> dict[str, tuple[int, int]]:
+    """Publish both checked tables after applying blocking rules."""
+    outputs = (
+        ("claims", claims, claim_settings.missing_id_severity, MISSING_CLAIM_ID_RULE),
+        ("transactions", transactions, transaction_settings.severity, TRANSACTION_AMOUNT_RULE),
+    )
+    for table, rows, severity, rule in outputs:
+        if severity == "block" and rows.filter(F.col("quarantine_reason") == rule).limit(1).count():
+            # Save quarantine and the rule result before the writer raises.
+            write_silver(table, rows, silver_path, severity=severity, report_rule=rule)
+
+    return {
+        table: write_silver(table, rows, silver_path, severity=severity, report_rule=rule)
+        for table, rows, severity, rule in outputs
+    }

@@ -11,6 +11,30 @@ from pyspark.sql import functions as F
 Severity = Literal["warn", "block"]
 
 
+def _severity(value: object) -> Severity:
+    if value == "warn":
+        return "warn"
+    if value == "block":
+        return "block"
+    raise ValueError("severity must be warn or block.")
+
+
+@dataclass(frozen=True)
+class ClaimRuleSettings:
+    missing_id_severity: Severity = "warn"
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> "ClaimRuleSettings":
+        with path.open(encoding="utf-8") as config:
+            document = yaml.safe_load(config)
+        if not isinstance(document, dict) or set(document) != {"missing_claim_id"}:
+            raise ValueError("Expected a missing_claim_id setting.")
+        rule = document["missing_claim_id"]
+        if not isinstance(rule, dict) or set(rule) != {"severity"}:
+            raise ValueError("missing_claim_id requires a severity setting.")
+        return cls(_severity(rule["severity"]))
+
+
 @dataclass(frozen=True)
 class TransactionRuleSettings:
     amount_required_types: tuple[str, ...]
@@ -33,10 +57,7 @@ class TransactionRuleSettings:
             or any(not isinstance(value, str) or not value.strip() for value in types)
         ):
             raise ValueError("amount_required_types must be a nonempty list of transaction types.")
-        severity = document.get("severity", "warn")
-        if severity not in ("warn", "block"):
-            raise ValueError("severity must be warn or block.")
-        return cls(tuple(types), severity)
+        return cls(tuple(types), _severity(document.get("severity", "warn")))
 
 
 @dataclass(frozen=True)

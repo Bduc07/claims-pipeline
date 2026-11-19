@@ -22,7 +22,12 @@ to quarantine, and the remaining rows are published. With `severity: block`,
 the notebook writes transaction quarantine and stops before publishing new
 silver outputs if the rule fails.
 
-Step 5 shows the latest transaction rule result from the append-only
+The missing claim ID rule uses `claim_rules.yaml`. It defaults to `warn`
+in Colab. To try `block`, put the edited file in
+`/content/src/claims_pipeline/claim_rules.yaml` before Step 4. A missing ID
+then stops both silver outputs after saving the claim quarantine and result.
+
+Step 5 shows the latest result for each rule from the append-only
 `/content/silver/dq_results` Parquet table. After a blocked run, you can
 still run that result cell by itself. The table lasts for the current
 Colab runtime.
