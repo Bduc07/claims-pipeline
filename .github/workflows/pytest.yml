@@ -63,4 +63,8 @@ jobs:
           finally:
               spark.stop()
           "
+            python /opt/airflow/project/scripts/export_cloud_demo.py
+            bash /opt/airflow/project/scripts/run_mapreduce.sh
+            printf "2026-01-05\t12.50\n" > /tmp/expected-payments.tsv
+            diff -u /tmp/expected-payments.tsv /opt/airflow/data/output/cloud_demo/mapreduce_output/part-00000
           '

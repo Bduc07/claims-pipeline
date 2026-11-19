@@ -201,6 +201,12 @@ Snowflake loader and reporter grants.
 - The project uses synthetic records. See SECURITY.md for what the
   security controls demonstrate and the limits of the example.
 
+### S3, Athena, and Hadoop extension
+
+See the [cloud demo guide](docs/S3_ATHENA_MAPREDUCE.md) to publish small
+reporting Parquet tables to S3, query them in Athena, and compare the
+weekly totals with Spark and a local Hadoop Streaming job.
+
 ### AWS deployment mapping
 
 The local path has no AWS dependency. For EMR Serverless, land CSVs in
