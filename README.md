@@ -27,6 +27,12 @@ Step 5 shows the latest transaction rule result from the append-only
 still run that result cell by itself. The table lasts for the current
 Colab runtime.
 
+To apply the optional eligibility rule in a Spark job, pass the Synthea
+`payer_transitions.csv` DataFrame as `coverage` to `clean_claims`.
+The rule matches patient and primary payer on the service date. Both dates
+are inclusive, a blank coverage end is open-ended, and claims without a
+primary payer skip this check.
+
 ## Verified results
 
 - Bronze processed 107 input files.

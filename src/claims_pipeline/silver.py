@@ -18,12 +18,12 @@ class SilverBatchBlocked(RuntimeError):
     """A blocking quality rule rejected this silver batch."""
 
 
-def clean_claims(claims: DataFrame) -> DataFrame:
+def clean_claims(claims: DataFrame, coverage: DataFrame | None = None) -> DataFrame:
     order = Window.partitionBy("Id").orderBy(
         F.col("source_file").endswith("_resend.csv").cast("int"),
         F.col("source_file"),
     )
-    return (
+    checked = (
         claims.withColumn("_rank", F.row_number().over(order))
         .filter(F.col("_rank") == 1)
         .drop("_rank")
@@ -32,6 +32,11 @@ def clean_claims(claims: DataFrame) -> DataFrame:
             F.when(F.col("STATUS1") == "UNKNOWN", F.lit("invalid_claim_status")),
         )
     )
+    if coverage is not None:
+        from .eligibility import flag_uncovered_claims
+
+        return flag_uncovered_claims(checked, coverage)
+    return checked
 
 
 def clean_transactions(

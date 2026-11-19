@@ -47,6 +47,43 @@ def test_silver_claims(spark, tmp_path):
     assert (invalid.Id, invalid.quarantine_reason) == ("claim-2", "invalid_claim_status")
 
 
+def test_claim_eligibility_checks_date_and_primary_payer(spark):
+    claims = spark.sql("""
+        SELECT *, 'claims_week.csv' AS source_file FROM VALUES
+            ('start', 'p1', 'payer-a', '2026-01-01T10:00:00Z', 'CLOSED'),
+            ('end', 'p1', 'payer-a', '2026-01-31T10:00:00Z', 'CLOSED'),
+            ('late', 'p1', 'payer-a', '2026-02-01T10:00:00Z', 'CLOSED'),
+            ('wrong-payer', 'p1', 'payer-b', '2026-01-15T10:00:00Z', 'CLOSED'),
+            ('other-patient', 'p9', 'payer-a', '2026-01-15T10:00:00Z', 'CLOSED'),
+            ('open-ended', 'p2', 'payer-a', '2026-02-01T10:00:00Z', 'CLOSED'),
+            ('bad-end', 'p3', 'payer-a', '2026-02-01T10:00:00Z', 'CLOSED'),
+            ('no-insurance', 'p9', '', '2026-01-15T10:00:00Z', 'CLOSED'),
+            ('bad-status', 'p9', 'payer-a', '2026-01-15T10:00:00Z', 'UNKNOWN')
+        AS claims (Id, PATIENTID, PRIMARYPATIENTINSURANCEID, SERVICEDATE, STATUS1)
+    """)
+    coverage = spark.sql("""
+        SELECT * FROM VALUES
+            ('p1', 'payer-a', '2026-01-01T00:00:00Z', '2026-01-31T00:00:00Z'),
+            ('p1', 'payer-a', '2026-01-01T00:00:00Z', '2026-01-31T00:00:00Z'),
+            ('p2', 'payer-a', '2026-01-01T00:00:00Z', NULL),
+            ('p3', 'payer-a', '2026-01-01T00:00:00Z', 'INVALID')
+        AS coverage (PATIENT, PAYER, START_DATE, END_DATE)
+    """)
+    actual = clean_claims(claims, coverage).select("Id", "quarantine_reason").collect()
+    assert len(actual) == 9
+    assert {row.Id: row.quarantine_reason for row in actual} == {
+        "start": None,
+        "end": None,
+        "late": "no_active_coverage",
+        "wrong-payer": "no_active_coverage",
+        "other-patient": "no_active_coverage",
+        "open-ended": None,
+        "bad-end": "no_active_coverage",
+        "no-insurance": None,
+        "bad-status": "invalid_claim_status",
+    }
+
+
 def test_silver_transactions(spark, tmp_path):
     transactions = spark.createDataFrame(
         [
