@@ -4,6 +4,16 @@ The demo compares weekly paid amounts across Spark, Athena, and Hadoop
 MapReduce using the same cleaned claims and transactions. Use only
 synthetic inputs and a fresh output folder for a new delivery.
 
+## Verified result
+
+Athena queried the synthetic Parquet snapshot in S3 in Asia Pacific
+(Sydney) and returned the following row. Spark and Hadoop Streaming
+produced the same weekly payment total in [Docker CI](https://github.com/Bduc07/claims-pipeline/actions/runs/44600181872).
+
+| Claim batch week | Claim count | Total paid |
+| --- | ---: | ---: |
+| 2026-01-05 | 1 | 12.50 |
+
 ## Build the outputs and run Hadoop
 
 Prepare the data folder and masking key as described in the [README](../README.md).

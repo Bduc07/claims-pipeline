@@ -206,6 +206,8 @@ Snowflake loader and reporter grants.
 See the [cloud demo guide](docs/S3_ATHENA_MAPREDUCE.md) to publish small
 reporting Parquet tables to S3, query them in Athena, and compare the
 weekly totals with Spark and a local Hadoop Streaming job.
+The live Athena query read the synthetic S3 snapshot and matched the
+weekly total of **12.50** produced by Spark and Hadoop in Docker CI.
 
 ### AWS deployment mapping
 
@@ -214,5 +216,5 @@ S3, submit a packaged Spark job with an execution role scoped to its
 input and output prefixes, and store run logs in S3. Replace local batch
 tracking and output publication with S3-backed implementations before
 deployment. The Snowflake extension would load S3 results through a
-storage integration and stage, then run the existing SQL merges. No AWS
-resources were created or EMR jobs executed for this project.
+storage integration and stage, then run the existing SQL merges.
+EMR Serverless remains a deployment plan.
