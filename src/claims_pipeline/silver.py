@@ -1,19 +1,23 @@
 """Validate bronze records and write silver and quarantine Parquet tables."""
 
 import logging
+from functools import reduce
+from operator import or_
 from pathlib import Path
 from uuid import uuid4
 
-from pyspark.sql import DataFrame
+from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from .rules import (
+    CLAIM_RULE_NAMES,
     ClaimRuleSettings,
     Rule,
     RuleEngine,
     Severity,
     TransactionRuleSettings,
+    mark_claim_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -34,18 +38,9 @@ def _check_reference(
         .filter(~F.col("_reference_id").rlike(r"^\s*$"))
         .distinct()
     )
-    return (
-        claims.join(
-            keys, F.col(claim_key) == F.col("_reference_id"), how="left"
-        )
-        .withColumn(
-            "quarantine_reason",
-            F.coalesce(
-                F.col("quarantine_reason"),
-                F.when(F.col("_reference_id").isNull(), F.lit(reason)),
-            ),
-        )
-        .drop("_reference_id")
+    matched = claims.join(keys, F.col(claim_key) == F.col("_reference_id"), how="left")
+    return mark_claim_failure(matched, reason, F.col("_reference_id").isNull()).drop(
+        "_reference_id"
     )
 
 
@@ -59,7 +54,7 @@ def clean_claims(
     missing_id = F.coalesce(F.col("Id"), F.lit("")).rlike(r"^\s*$")
     rejected = claims.filter(missing_id).withColumn(
         "quarantine_reason", F.lit(MISSING_CLAIM_ID_RULE)
-    )
+    ).withColumn(f"_dq_{MISSING_CLAIM_ID_RULE}", F.lit(True))
     order = Window.partitionBy("Id").orderBy(
         F.col("source_file").endswith("_resend.csv").cast("int"),
         F.col("source_file"),
@@ -72,10 +67,10 @@ def clean_claims(
         .drop("_rank")
         .withColumn(
             "quarantine_reason",
-            F.when(F.col("STATUS1") == "UNKNOWN", F.lit("invalid_claim_status"))
-            .when(invalid_date, F.lit("invalid_service_date")),
+            F.when(F.col("STATUS1") == "UNKNOWN", F.lit("invalid_claim_status")),
         )
     )
+    checked = mark_claim_failure(checked, "invalid_service_date", invalid_date)
     if patients is not None:
         checked = _check_reference(checked, patients, "PATIENTID", "unknown_patient")
     if providers is not None:
@@ -83,8 +78,8 @@ def clean_claims(
     if coverage is not None:
         from .eligibility import flag_uncovered_claims
 
-        checked = flag_uncovered_claims(checked, coverage)
-    return checked.unionByName(rejected)
+        checked = flag_uncovered_claims(checked, coverage, ~F.col("_dq_invalid_service_date"))
+    return checked.unionByName(rejected, allowMissingColumns=True)
 
 
 def clean_transactions(
@@ -107,6 +102,13 @@ def clean_transactions(
     return RuleEngine((amount_rule, charge_minimum_rule)).annotate(parsed)
 
 
+def _rule_failed(checked: DataFrame, rule: str) -> Column:
+    flag = f"_dq_{rule}"
+    if flag in checked.columns:
+        return F.col(flag)
+    return F.col("quarantine_reason") == rule
+
+
 def write_silver(
     table: str,
     checked: DataFrame,
@@ -115,28 +117,33 @@ def write_silver(
     severity: Severity = "warn",
     report_rule: str | None = None,
     warning_rules: tuple[str, ...] = (),
+    configured_rules: tuple[tuple[str, Severity], ...] = (),
     run_id: str | None = None,
 ) -> tuple[int, int]:
-    masked = checked.withColumn("PATIENTID", F.sha2(F.col("PATIENTID"), 256))
+    masked = checked.drop(*(f"_dq_{rule}" for rule in CLAIM_RULE_NAMES)).withColumn(
+        "PATIENTID", F.sha2(F.col("PATIENTID"), 256)
+    )
     valid = masked.filter(F.col("quarantine_reason").isNull()).drop("quarantine_reason")
     invalid = masked.filter(F.col("quarantine_reason").isNotNull())
-    counts = {
-        row.quarantine_reason: row["count"]
-        for row in checked.groupBy("quarantine_reason").count().collect()
-    }
-    accepted = counts.get(None, 0)
-    rows_checked = sum(counts.values())
-    rejected = rows_checked - accepted
-    invalid.write.mode("overwrite").parquet(f"{silver_path}/quarantine/{table}")
-    failed = rejected if report_rule is None else counts.get(report_rule, 0)
-    blocked = failed > 0 and severity == "block"
-    reports = [(rule, "warn") for rule in warning_rules]
+    reports = [*configured_rules, *((rule, "warn") for rule in warning_rules)]
     if report_rule is not None:
         reports.insert(0, (report_rule, severity))
+    counts = checked.agg(
+        F.count("*").alias("rows_checked"),
+        F.count_if(F.col("quarantine_reason").isNull()).alias("accepted"),
+        *(F.count_if(_rule_failed(checked, rule)).alias(rule) for rule, _ in reports),
+    ).first()
+    accepted = counts.accepted
+    rows_checked = counts.rows_checked
+    rejected = rows_checked - accepted
+    invalid.write.mode("overwrite").parquet(f"{silver_path}/quarantine/{table}")
+    blocked = any(level == "block" and counts[rule] > 0 for rule, level in reports)
+    if report_rule is None and not configured_rules:
+        blocked = blocked or (severity == "block" and rejected > 0)
     if reports:
         entries = []
         for rule, rule_severity in reports:
-            failures = counts.get(rule, 0)
+            failures = counts[rule]
             result = "passed"
             if failures:
                 result = "blocked" if rule_severity == "block" else "warned"
@@ -180,38 +187,30 @@ def write_silver_batch(
 ) -> dict[str, tuple[int, int]]:
     """Publish both checked tables after applying blocking rules."""
     run_id = str(uuid4())
+    claim_rules = tuple(
+        (rule, severity)
+        for rule, severity in claim_settings.rules()
+        if rule == MISSING_CLAIM_ID_RULE or f"_dq_{rule}" in claims.columns
+    )
     outputs = (
-        ("claims", claims, claim_settings.missing_id_severity, MISSING_CLAIM_ID_RULE, ()),
+        ("claims", claims, claim_rules),
         (
             "transactions",
             transactions,
-            transaction_settings.severity,
-            TRANSACTION_AMOUNT_RULE,
-            (CHARGE_MINIMUM_RULE,),
+            ((TRANSACTION_AMOUNT_RULE, transaction_settings.severity), (CHARGE_MINIMUM_RULE, "warn")),
         ),
     )
-    for table, rows, severity, rule, warning_rules in outputs:
-        if severity == "block" and rows.filter(F.col("quarantine_reason") == rule).limit(1).count():
+    for table, rows, rules in outputs:
+        blockers = [_rule_failed(rows, rule) for rule, level in rules if level == "block"]
+        if blockers and rows.filter(reduce(or_, blockers)).limit(1).count():
             # Save quarantine and the rule result before the writer raises.
             write_silver(
-                table,
-                rows,
-                silver_path,
-                severity=severity,
-                report_rule=rule,
-                warning_rules=warning_rules,
-                run_id=run_id,
+                table, rows, silver_path, configured_rules=rules, run_id=run_id
             )
 
     return {
         table: write_silver(
-            table,
-            rows,
-            silver_path,
-            severity=severity,
-            report_rule=rule,
-            warning_rules=warning_rules,
-            run_id=run_id,
+            table, rows, silver_path, configured_rules=rules, run_id=run_id
         )
-        for table, rows, severity, rule, warning_rules in outputs
+        for table, rows, rules in outputs
     }

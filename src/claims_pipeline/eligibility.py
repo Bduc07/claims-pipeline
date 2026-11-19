@@ -1,10 +1,14 @@
 """Check Synthea claims against primary-payer coverage dates."""
 
-from pyspark.sql import DataFrame
+from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 
+from .rules import mark_claim_failure
 
-def flag_uncovered_claims(claims: DataFrame, coverage: DataFrame) -> DataFrame:
+
+def flag_uncovered_claims(
+    claims: DataFrame, coverage: DataFrame, valid_service_date: Column
+) -> DataFrame:
     """Label insured claims without active coverage, preserving earlier failures."""
     periods = coverage.select(
         F.col("PATIENT").alias("covered_patient"),
@@ -28,14 +32,7 @@ def flag_uncovered_claims(claims: DataFrame, coverage: DataFrame) -> DataFrame:
         .select("Id")
         .withColumn("_has_coverage", F.lit(True))
     )
-    return (
-        claims.join(eligible, on="Id", how="left")
-        .withColumn(
-            "quarantine_reason",
-            F.coalesce(
-                F.col("quarantine_reason"),
-                F.when(insured & F.col("_has_coverage").isNull(), F.lit("no_active_coverage")),
-            ),
-        )
-        .drop("_has_coverage")
-    )
+    matched = claims.join(eligible, on="Id", how="left")
+    return mark_claim_failure(
+        matched, "no_active_coverage", insured & valid_service_date & F.col("_has_coverage").isNull()
+    ).drop("_has_coverage")

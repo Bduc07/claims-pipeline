@@ -10,6 +10,13 @@ from pyspark.sql import Column, DataFrame
 from pyspark.sql import functions as F
 
 Severity = Literal["warn", "block"]
+CLAIM_RULE_NAMES = (
+    "missing_claim_id",
+    "invalid_service_date",
+    "unknown_patient",
+    "unknown_provider",
+    "no_active_coverage",
+)
 
 
 def _severity(value: object) -> Severity:
@@ -23,17 +30,41 @@ def _severity(value: object) -> Severity:
 @dataclass(frozen=True)
 class ClaimRuleSettings:
     missing_id_severity: Severity = "warn"
+    service_date_severity: Severity = "warn"
+    patient_severity: Severity = "warn"
+    provider_severity: Severity = "warn"
+    coverage_severity: Severity = "warn"
+
+    def rules(self) -> tuple[tuple[str, Severity], ...]:
+        return (
+            ("missing_claim_id", self.missing_id_severity),
+            ("invalid_service_date", self.service_date_severity),
+            ("unknown_patient", self.patient_severity),
+            ("unknown_provider", self.provider_severity),
+            ("no_active_coverage", self.coverage_severity),
+        )
 
     @classmethod
     def from_yaml(cls, path: Path) -> "ClaimRuleSettings":
         with path.open(encoding="utf-8") as config:
             document = yaml.safe_load(config)
-        if not isinstance(document, dict) or set(document) != {"missing_claim_id"}:
-            raise ValueError("Expected a missing_claim_id setting.")
-        rule = document["missing_claim_id"]
-        if not isinstance(rule, dict) or set(rule) != {"severity"}:
-            raise ValueError("missing_claim_id requires a severity setting.")
-        return cls(_severity(rule["severity"]))
+        if not isinstance(document, dict) or set(document) - set(CLAIM_RULE_NAMES):
+            raise ValueError("Expected supported claim rule settings.")
+        severities = []
+        for name in CLAIM_RULE_NAMES:
+            rule = document.get(name, {"severity": "warn"})
+            if not isinstance(rule, dict) or set(rule) != {"severity"}:
+                raise ValueError(f"{name} requires a severity setting.")
+            severities.append(_severity(rule["severity"]))
+        return cls(*severities)
+
+
+def mark_claim_failure(claims: DataFrame, rule: str, condition: Column) -> DataFrame:
+    """Track each failed rule while retaining the first reason for quarantine."""
+    return claims.withColumn(f"_dq_{rule}", condition).withColumn(
+        "quarantine_reason",
+        F.coalesce(F.col("quarantine_reason"), F.when(F.col(f"_dq_{rule}"), F.lit(rule))),
+    )
 
 
 @dataclass(frozen=True)

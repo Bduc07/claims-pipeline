@@ -1,2 +1,10 @@
 missing_claim_id:
   severity: warn
+invalid_service_date:
+  severity: warn
+unknown_patient:
+  severity: warn
+unknown_provider:
+  severity: warn
+no_active_coverage:
+  severity: warn

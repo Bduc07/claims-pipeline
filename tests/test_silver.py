@@ -162,6 +162,67 @@ def test_missing_claim_id_severity_controls_publication(spark, tmp_path, monkeyp
         assert tmp_path / "transactions" in writes
 
 
+def test_configured_claim_rule_blocks_despite_earlier_warning(spark, tmp_path, monkeypatch):
+    config = tmp_path / "claim_rules.yaml"
+    config.write_text(
+        "invalid_service_date: {severity: warn}\n"
+        "unknown_patient: {severity: warn}\n"
+        "unknown_provider: {severity: block}\n"
+        "no_active_coverage: {severity: warn}\n",
+        encoding="utf-8",
+    )
+    claims = spark.sql("""
+        SELECT *, 'claims_week.csv' AS source_file, 'payer-a' AS PRIMARYPATIENTINSURANCEID
+        FROM VALUES
+            ('valid', 'patient-1', 'provider-1', '2026-01-05', 'CLOSED'),
+            ('bad-date', 'patient-1', 'provider-1', '2026-02-30', 'CLOSED'),
+            ('bad-patient', 'patient-2', 'provider-1', '2026-01-05', 'CLOSED'),
+            ('bad-provider', 'patient-1', 'provider-2', '2026-01-05', 'UNKNOWN'),
+            ('uncovered', 'patient-1', 'provider-1', '2026-02-01', 'CLOSED')
+        AS claims (Id, PATIENTID, PROVIDERID, SERVICEDATE, STATUS1)
+    """)
+    coverage = spark.sql("""
+        SELECT * FROM VALUES
+            ('patient-1', 'payer-a', '2026-01-01', '2026-01-31'),
+            ('patient-2', 'payer-a', '2026-01-01', '2026-01-31')
+        AS coverage (PATIENT, PAYER, START_DATE, END_DATE)
+    """)
+    patients = spark.sql("SELECT 'patient-1' AS Id")
+    providers = spark.sql("SELECT 'provider-1' AS Id")
+    transactions = spark.sql("SELECT 'patient-1' AS PATIENTID, cast(NULL AS STRING) AS quarantine_reason")
+    writes = []
+    audit = []
+
+    def capture_write(writer, destination):
+        target = Path(destination)
+        writes.append(target)
+        if target.name == "dq_results":
+            audit.extend(writer._df.collect())
+        else:
+            [row] = writer._df.filter("Id = 'bad-provider'").collect()
+            assert row.quarantine_reason == "invalid_claim_status"
+            assert not any(name.startswith("_dq_") for name in row.asDict())
+
+    monkeypatch.setattr(DataFrameWriter, "parquet", capture_write)
+    with pytest.raises(SilverBatchBlocked, match="4 row"):
+        write_silver_batch(
+            clean_claims(claims, coverage, patients=patients, providers=providers),
+            transactions,
+            tmp_path,
+            ClaimRuleSettings.from_yaml(config),
+            TransactionRuleSettings(("CHARGE",)),
+        )
+
+    assert writes == [tmp_path / "quarantine" / "claims", tmp_path / "dq_results"]
+    assert {row.rule_name: (row.rows_failed, row.result) for row in audit} == {
+        "missing_claim_id": (0, "passed"),
+        "invalid_service_date": (1, "warned"),
+        "unknown_patient": (1, "warned"),
+        "unknown_provider": (1, "blocked"),
+        "no_active_coverage": (1, "warned"),
+    }
+
+
 def test_claim_patient_and_provider_references(spark):
     claims = spark.sql("""
         SELECT *, 'claims_week.csv' AS source_file, '2026-01-05' AS SERVICEDATE FROM VALUES

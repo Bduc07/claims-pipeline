@@ -25,10 +25,12 @@ The `charge_minimum` setting in `transaction_rules.yaml` defaults to
 `0.00`. Charges below it go to quarantine. Payment and transfer amounts
 are outside this range check.
 
-The missing claim ID rule uses `claim_rules.yaml`. It defaults to `warn`
-in Colab. To try `block`, put the edited file in
-`/content/src/claims_pipeline/claim_rules.yaml` before Step 4. A missing ID
-then stops both silver outputs after saving the claim quarantine and result.
+Claim rules default to `warn`. You can set `block` independently for
+missing IDs, invalid service dates, unknown patients, unknown providers,
+and missing coverage in `claim_rules.yaml`. To load overrides in Colab,
+put the edited file in `/content/src/claims_pipeline/claim_rules.yaml`
+before Step 4. When an enabled rule blocks, silver saves the claim
+quarantine and rule results before stopping both publications.
 
 Step 5 shows the latest result for each rule from the append-only
 `/content/silver/dq_results` Parquet table. After a blocked run, you can
@@ -52,6 +54,9 @@ The checks compare the patient and provider IDs on each claim to the
 reference tables before patient IDs
 are hashed. Claims with missing or unrecognized patient or provider
 references go to quarantine when the corresponding check is enabled.
+Reference and coverage checks write audit rows only when their input
+tables are supplied. A claim can count toward more than one failed
+rule in the audit. Its quarantine row keeps the first failure reason.
 
 ## Verified results
 
