@@ -3,7 +3,6 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
-from pyspark.sql import SparkSession
 from pyspark.sql.readwriter import DataFrameWriter
 
 from src.claims_pipeline.rules import ClaimRuleSettings, TransactionRuleSettings
@@ -15,18 +14,6 @@ from src.claims_pipeline.silver import (
     write_silver,
     write_silver_batch,
 )
-
-
-@pytest.fixture(scope="module")
-def spark():
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("claims-pipeline-tests")
-        .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
-    )
-    yield session
-    session.stop()
 
 
 def test_silver_claims(spark, tmp_path):
@@ -46,6 +33,35 @@ def test_silver_claims(spark, tmp_path):
     assert valid.PATIENTID == hashlib.sha256(b"patient-1").hexdigest()
     assert invalid.PATIENTID == valid.PATIENTID
     assert (invalid.Id, invalid.quarantine_reason) == ("claim-2", "invalid_claim_status")
+
+
+def test_bronze_rows_reconcile_with_silver(spark):
+    claims = spark.sql("""
+        SELECT * FROM VALUES
+            ('claim-1', 'CLOSED', 'claims_week.csv'),
+            ('claim-1', 'CLOSED', 'claims_week_resend.csv'),
+            ('claim-2', 'UNKNOWN', 'claims_week.csv')
+        AS claims (Id, STATUS1, source_file)
+    """)
+    transactions = spark.sql("""
+        SELECT * FROM VALUES ('CHARGE', '12.34'), ('PAYMENT', NULL), ('CHARGE', 'INVALID')
+        AS transactions (TYPE, AMOUNT)
+    """)
+
+    checked_claims = clean_claims(claims).collect()
+    valid_claims = [row.Id for row in checked_claims if row.quarantine_reason is None]
+    rejected_claims = [row.Id for row in checked_claims if row.quarantine_reason is not None]
+    resend_count = claims.filter("source_file = 'claims_week_resend.csv'").count()
+    assert (valid_claims, rejected_claims, resend_count) == (["claim-1"], ["claim-2"], 1)
+    assert all(row.source_file == "claims_week.csv" for row in checked_claims)
+    assert claims.count() == len(valid_claims) + len(rejected_claims) + resend_count
+
+    settings = TransactionRuleSettings(("CHARGE", "TRANSFERIN"))
+    checked_transactions = clean_transactions(transactions, settings).collect()
+    rejected_transactions = sum(row.quarantine_reason is not None for row in checked_transactions)
+    valid_transactions = sum(row.quarantine_reason is None for row in checked_transactions)
+    assert (valid_transactions, rejected_transactions) == (2, 1)
+    assert transactions.count() == valid_transactions + rejected_transactions
 
 
 def test_missing_claim_ids_are_preserved_before_deduplication(spark):
