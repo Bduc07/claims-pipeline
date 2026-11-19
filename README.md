@@ -34,6 +34,9 @@ Step 5 shows the latest result for each rule from the append-only
 `/content/silver/dq_results` Parquet table. After a blocked run, you can
 still run that result cell by itself. The table lasts for the current
 Colab runtime.
+The amount and charge minimum rules each get a summary row, even with zero
+failures. Both use the same batch run ID. The charge minimum is a warning
+rule regardless of the configured severity of the amount rule.
 
 To apply the optional eligibility rule in a Spark job, pass the Synthea
 `payer_transitions.csv` DataFrame as `coverage` to `clean_claims`.

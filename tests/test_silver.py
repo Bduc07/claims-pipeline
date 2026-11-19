@@ -9,6 +9,7 @@ from pyspark.sql.readwriter import DataFrameWriter
 
 from src.claims_pipeline.rules import ClaimRuleSettings, TransactionRuleSettings
 from src.claims_pipeline.silver import (
+    CHARGE_MINIMUM_RULE,
     TRANSACTION_AMOUNT_RULE,
     SilverBatchBlocked,
     clean_claims,
@@ -275,6 +276,7 @@ def test_silver_transactions(spark, tmp_path):
         tmp_path,
         severity=settings.severity,
         report_rule=TRANSACTION_AMOUNT_RULE,
+        warning_rules=(CHARGE_MINIMUM_RULE,),
     ) == (3, 2)
     valid = spark.read.parquet(str(tmp_path / "transactions")).collect()
     invalid = spark.read.parquet(str(tmp_path / "quarantine" / "transactions")).collect()
@@ -290,9 +292,16 @@ def test_silver_transactions(spark, tmp_path):
     assert {row.PATIENTID for row in valid + invalid} == {
         hashlib.sha256(b"patient-1").hexdigest()
     }
-    [result] = spark.read.parquet(str(tmp_path / "dq_results")).collect()
-    assert (result.rule_name, result.severity) == (TRANSACTION_AMOUNT_RULE, "warn")
-    assert (result.rows_checked, result.rows_failed, result.result) == (5, 2, "warned")
+    audit = spark.read.parquet(str(tmp_path / "dq_results")).collect()
+    assert len(audit) == 2
+    assert len({row.run_id for row in audit}) == 1
+    assert {
+        row.rule_name: (row.severity, row.rows_checked, row.rows_failed, row.result)
+        for row in audit
+    } == {
+        TRANSACTION_AMOUNT_RULE: ("warn", 5, 2, "warned"),
+        CHARGE_MINIMUM_RULE: ("warn", 5, 0, "passed"),
+    }
 
 
 def test_transaction_amount_requirement_follows_yaml(spark, tmp_path):
@@ -342,6 +351,49 @@ def test_charge_minimum_follows_yaml(spark, tmp_path, minimum, charge_at_zero):
         "payment": None,
         "transfer": None,
         "malformed": TRANSACTION_AMOUNT_RULE,
+    }
+
+
+@pytest.mark.parametrize(
+    ("amounts", "severity", "amount_failures", "range_failures"),
+    [
+        ("('12.34'), ('INVALID'), ('-5.00')", "warn", 1, 1),
+        ("('12.34'), ('0.00'), ('5.00')", "warn", 0, 0),
+        ("('12.34'), ('0.00'), ('-5.00')", "block", 0, 1),
+    ],
+)
+def test_transaction_rules_share_an_audit_run(
+    spark, tmp_path, monkeypatch, amounts, severity, amount_failures, range_failures
+):
+    claims = spark.sql("SELECT 'patient-1' AS PATIENTID, cast(NULL AS STRING) AS quarantine_reason")
+    transactions = spark.sql(f"""
+        SELECT 'patient-1' AS PATIENTID, 'CHARGE' AS TYPE, AMOUNT
+        FROM VALUES {amounts} AS transactions (AMOUNT)
+    """)
+    settings = TransactionRuleSettings(("CHARGE",), severity)
+    audit = []
+
+    def capture_write(writer, destination):
+        if Path(destination).name == "dq_results":
+            audit.extend(writer._df.collect())
+
+    monkeypatch.setattr(DataFrameWriter, "parquet", capture_write)
+    counts = write_silver_batch(
+        claims, clean_transactions(transactions, settings), tmp_path, ClaimRuleSettings(), settings
+    )
+    rejected = amount_failures + range_failures
+    assert counts["transactions"] == (3 - rejected, rejected)
+    assert len({row.run_id for row in audit}) == 1
+    transaction_audit = [row for row in audit if row.table_name == "transactions"]
+    assert len(transaction_audit) == 2
+    assert {
+        row.rule_name: (row.rows_checked, row.rows_failed, row.severity, row.result)
+        for row in transaction_audit
+    } == {
+        TRANSACTION_AMOUNT_RULE: (
+            3, amount_failures, severity, "warned" if amount_failures else "passed"
+        ),
+        CHARGE_MINIMUM_RULE: (3, range_failures, "warn", "warned" if range_failures else "passed"),
     }
 
 

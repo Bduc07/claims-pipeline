@@ -18,6 +18,7 @@ from .rules import (
 
 logger = logging.getLogger(__name__)
 TRANSACTION_AMOUNT_RULE = "invalid_or_missing_amount"
+CHARGE_MINIMUM_RULE = "charge_amount_below_minimum"
 MISSING_CLAIM_ID_RULE = "missing_claim_id"
 
 
@@ -99,7 +100,7 @@ def clean_transactions(
         fails_when=F.col("amount_decimal").isNull() & (amount_required | amount_present),
     )
     charge_minimum_rule = Rule(
-        name="charge_amount_below_minimum",
+        name=CHARGE_MINIMUM_RULE,
         fails_when=(F.col("TYPE") == "CHARGE")
         & (F.col("amount_decimal") < F.lit(settings.charge_minimum)),
     )
@@ -113,27 +114,51 @@ def write_silver(
     *,
     severity: Severity = "warn",
     report_rule: str | None = None,
+    warning_rules: tuple[str, ...] = (),
+    run_id: str | None = None,
 ) -> tuple[int, int]:
     masked = checked.withColumn("PATIENTID", F.sha2(F.col("PATIENTID"), 256))
     valid = masked.filter(F.col("quarantine_reason").isNull()).drop("quarantine_reason")
     invalid = masked.filter(F.col("quarantine_reason").isNotNull())
-    rejected = invalid.count()
+    counts = {
+        row.quarantine_reason: row["count"]
+        for row in checked.groupBy("quarantine_reason").count().collect()
+    }
+    accepted = counts.get(None, 0)
+    rows_checked = sum(counts.values())
+    rejected = rows_checked - accepted
     invalid.write.mode("overwrite").parquet(f"{silver_path}/quarantine/{table}")
-    failed = rejected
-    if report_rule is not None:
-        failed = invalid.filter(F.col("quarantine_reason") == report_rule).count()
+    failed = rejected if report_rule is None else counts.get(report_rule, 0)
     blocked = failed > 0 and severity == "block"
+    reports = [(rule, "warn") for rule in warning_rules]
     if report_rule is not None:
-        result = "blocked" if blocked else "warned" if failed else "passed"
+        reports.insert(0, (report_rule, severity))
+    if reports:
+        entries = []
+        for rule, rule_severity in reports:
+            failures = counts.get(rule, 0)
+            result = "passed"
+            if failures:
+                result = "blocked" if rule_severity == "block" else "warned"
+            entries.append(
+                F.struct(
+                    F.lit(rule).alias("rule_name"),
+                    F.lit(rule_severity).alias("severity"),
+                    F.lit(failures).cast("long").alias("rows_failed"),
+                    F.lit(result).alias("result"),
+                )
+            )
         summary = checked.sparkSession.range(1).select(
-            F.lit(str(uuid4())).alias("run_id"),
+            F.explode(F.array(*entries)).alias("rule_result")
+        ).select(
+            F.lit(run_id or str(uuid4())).alias("run_id"),
             F.current_timestamp().alias("checked_at"),
             F.lit(table).alias("table_name"),
-            F.lit(report_rule).alias("rule_name"),
-            F.lit(severity).alias("severity"),
-            F.lit(checked.count()).cast("long").alias("rows_checked"),
-            F.lit(failed).cast("long").alias("rows_failed"),
-            F.lit(result).alias("result"),
+            "rule_result.rule_name",
+            "rule_result.severity",
+            F.lit(rows_checked).cast("long").alias("rows_checked"),
+            "rule_result.rows_failed",
+            "rule_result.result",
         )
         summary.write.mode("append").parquet(f"{silver_path}/dq_results")
     if blocked:
@@ -143,7 +168,7 @@ def write_silver(
     if rejected:
         logger.warning("Continuing silver %s with %d quarantined row(s)", table, rejected)
     valid.write.mode("overwrite").parquet(f"{silver_path}/{table}")
-    return valid.count(), rejected
+    return accepted, rejected
 
 
 def write_silver_batch(
@@ -154,16 +179,39 @@ def write_silver_batch(
     transaction_settings: TransactionRuleSettings,
 ) -> dict[str, tuple[int, int]]:
     """Publish both checked tables after applying blocking rules."""
+    run_id = str(uuid4())
     outputs = (
-        ("claims", claims, claim_settings.missing_id_severity, MISSING_CLAIM_ID_RULE),
-        ("transactions", transactions, transaction_settings.severity, TRANSACTION_AMOUNT_RULE),
+        ("claims", claims, claim_settings.missing_id_severity, MISSING_CLAIM_ID_RULE, ()),
+        (
+            "transactions",
+            transactions,
+            transaction_settings.severity,
+            TRANSACTION_AMOUNT_RULE,
+            (CHARGE_MINIMUM_RULE,),
+        ),
     )
-    for table, rows, severity, rule in outputs:
+    for table, rows, severity, rule, warning_rules in outputs:
         if severity == "block" and rows.filter(F.col("quarantine_reason") == rule).limit(1).count():
             # Save quarantine and the rule result before the writer raises.
-            write_silver(table, rows, silver_path, severity=severity, report_rule=rule)
+            write_silver(
+                table,
+                rows,
+                silver_path,
+                severity=severity,
+                report_rule=rule,
+                warning_rules=warning_rules,
+                run_id=run_id,
+            )
 
     return {
-        table: write_silver(table, rows, silver_path, severity=severity, report_rule=rule)
-        for table, rows, severity, rule in outputs
+        table: write_silver(
+            table,
+            rows,
+            silver_path,
+            severity=severity,
+            report_rule=rule,
+            warning_rules=warning_rules,
+            run_id=run_id,
+        )
+        for table, rows, severity, rule, warning_rules in outputs
     }
