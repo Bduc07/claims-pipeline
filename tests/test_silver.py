@@ -155,7 +155,11 @@ def test_missing_claim_id_severity_controls_publication(spark, tmp_path, monkeyp
     if severity == "block":
         with pytest.raises(SilverBatchBlocked, match="4 row"):
             write_silver_batch(*args)
-        assert writes == [tmp_path / "quarantine" / "claims", tmp_path / "dq_results"]
+        assert writes == [
+            tmp_path / "quarantine" / "claims",
+            tmp_path / "dq_results",
+            tmp_path / "pipeline_runs",
+        ]
     else:
         assert write_silver_batch(*args) == {"claims": (1, 4), "transactions": (1, 0)}
         assert tmp_path / "claims" in writes
@@ -192,12 +196,15 @@ def test_configured_claim_rule_blocks_despite_earlier_warning(spark, tmp_path, m
     transactions = spark.sql("SELECT 'patient-1' AS PATIENTID, cast(NULL AS STRING) AS quarantine_reason")
     writes = []
     audit = []
+    runs = []
 
     def capture_write(writer, destination):
         target = Path(destination)
         writes.append(target)
         if target.name == "dq_results":
             audit.extend(writer._df.collect())
+        elif target.name == "pipeline_runs":
+            runs.extend(writer._df.collect())
         else:
             [row] = writer._df.filter("Id = 'bad-provider'").collect()
             assert row.quarantine_reason == "invalid_claim_status"
@@ -213,7 +220,14 @@ def test_configured_claim_rule_blocks_despite_earlier_warning(spark, tmp_path, m
             TransactionRuleSettings(("CHARGE",)),
         )
 
-    assert writes == [tmp_path / "quarantine" / "claims", tmp_path / "dq_results"]
+    assert writes == [
+        tmp_path / "quarantine" / "claims",
+        tmp_path / "dq_results",
+        tmp_path / "pipeline_runs",
+    ]
+    [run] = runs
+    assert (run.status, run.rows_in, run.rows_published, run.rows_quarantined) == ("blocked", 6, 0, 4)
+    assert {row.run_id for row in audit} == {run.run_id}
     assert {row.rule_name: (row.rows_failed, row.result) for row in audit} == {
         "missing_claim_id": (0, "passed"),
         "invalid_service_date": (1, "warned"),
@@ -433,10 +447,13 @@ def test_transaction_rules_share_an_audit_run(
     """)
     settings = TransactionRuleSettings(("CHARGE",), severity)
     audit = []
+    runs = []
 
     def capture_write(writer, destination):
         if Path(destination).name == "dq_results":
             audit.extend(writer._df.collect())
+        elif Path(destination).name == "pipeline_runs":
+            runs.extend(writer._df.collect())
 
     monkeypatch.setattr(DataFrameWriter, "parquet", capture_write)
     counts = write_silver_batch(
@@ -444,7 +461,11 @@ def test_transaction_rules_share_an_audit_run(
     )
     rejected = amount_failures + range_failures
     assert counts["transactions"] == (3 - rejected, rejected)
-    assert len({row.run_id for row in audit}) == 1
+    [run] = runs
+    assert (run.status, run.rows_in, run.rows_published) == ("succeeded", 4, 4 - rejected)
+    assert run.rows_quarantined == rejected
+    assert run.stage == "silver" and run.started_at is not None and run.duration_seconds >= 0
+    assert {row.run_id for row in audit} == {run.run_id}
     transaction_audit = [row for row in audit if row.table_name == "transactions"]
     assert len(transaction_audit) == 2
     assert {
@@ -456,6 +477,29 @@ def test_transaction_rules_share_an_audit_run(
         ),
         CHARGE_MINIMUM_RULE: (3, range_failures, "warn", "warned" if range_failures else "passed"),
     }
+
+
+def test_pipeline_runs_persists_success_and_block(spark, tmp_path):
+    claims = spark.sql("SELECT 'patient-1' AS PATIENTID, cast(NULL AS STRING) AS quarantine_reason")
+    transactions = spark.sql("""
+        SELECT 'patient-1' AS PATIENTID, 'CHARGE' AS TYPE, AMOUNT
+        FROM VALUES ('10.00'), ('INVALID') AS transactions (AMOUNT)
+    """)
+    claim_rules = ClaimRuleSettings()
+    warn = TransactionRuleSettings(("CHARGE",))
+    checked = clean_transactions(transactions, warn)
+    assert write_silver_batch(claims, checked, tmp_path, claim_rules, warn)["transactions"] == (1, 1)
+    block = TransactionRuleSettings(("CHARGE",), "block")
+    with pytest.raises(SilverBatchBlocked):
+        write_silver_batch(claims, checked, tmp_path, claim_rules, block)
+
+    runs = spark.read.parquet(str(tmp_path / "pipeline_runs")).collect()
+    assert len(runs) == 2
+    assert {
+        row.status: (row.rows_in, row.rows_published, row.rows_quarantined) for row in runs
+    } == {"succeeded": (3, 2, 1), "blocked": (3, 0, 1)}
+    audit = spark.read.parquet(str(tmp_path / "dq_results")).select("run_id").distinct().collect()
+    assert {row.run_id for row in runs} == {row.run_id for row in audit}
 
 
 @pytest.mark.parametrize("minimum", ["bad", "NaN", "0.001", "10000000000000000.00"])

@@ -40,6 +40,13 @@ The amount and charge minimum rules each get a summary row, even with zero
 failures. Both use the same batch run ID. The charge minimum is a warning
 rule regardless of the configured severity of the amount rule.
 
+Silver appends one run record to `/content/silver/pipeline_runs`. Use its
+`run_id` to look up matching `dq_results`. The record includes the stage,
+start time, duration, status, and counts. `rows_in` counts the checked
+claims after deduplication plus the checked transactions. A blocked run
+publishes zero rows. Counts can be unavailable if an unexpected error
+interrupts processing.
+
 To apply the optional eligibility rule in a Spark job, pass the Synthea
 `payer_transitions.csv` DataFrame as `coverage` to `clean_claims`.
 The rule matches patient and primary payer on the service date. Both dates

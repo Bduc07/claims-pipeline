@@ -1,9 +1,11 @@
 """Validate bronze records and write silver and quarantine Parquet tables."""
 
 import logging
+from datetime import UTC, datetime
 from functools import reduce
 from operator import or_
 from pathlib import Path
+from time import perf_counter
 from uuid import uuid4
 
 from pyspark.sql import Column, DataFrame
@@ -28,6 +30,10 @@ MISSING_CLAIM_ID_RULE = "missing_claim_id"
 
 class SilverBatchBlocked(RuntimeError):
     """A blocking quality rule rejected this silver batch."""
+
+    def __init__(self, message: str, rows_quarantined: int) -> None:
+        super().__init__(message)
+        self.rows_quarantined = rows_quarantined
 
 
 def _check_reference(
@@ -171,7 +177,7 @@ def write_silver(
     if blocked:
         message = f"Silver batch blocked for {table}: {rejected} row(s) quarantined"
         logger.error(message)
-        raise SilverBatchBlocked(message)
+        raise SilverBatchBlocked(message, rejected)
     if rejected:
         logger.warning("Continuing silver %s with %d quarantined row(s)", table, rejected)
     valid.write.mode("overwrite").parquet(f"{silver_path}/{table}")
@@ -187,6 +193,8 @@ def write_silver_batch(
 ) -> dict[str, tuple[int, int]]:
     """Publish both checked tables after applying blocking rules."""
     run_id = str(uuid4())
+    started_at = datetime.now(UTC)
+    started_clock = perf_counter()
     claim_rules = tuple(
         (rule, severity)
         for rule, severity in claim_settings.rules()
@@ -200,17 +208,55 @@ def write_silver_batch(
             ((TRANSACTION_AMOUNT_RULE, transaction_settings.severity), (CHARGE_MINIMUM_RULE, "warn")),
         ),
     )
-    for table, rows, rules in outputs:
-        blockers = [_rule_failed(rows, rule) for rule, level in rules if level == "block"]
-        if blockers and rows.filter(reduce(or_, blockers)).limit(1).count():
-            # Save quarantine and the rule result before the writer raises.
-            write_silver(
+    rows_in = None
+    quarantined = None
+    results: dict[str, tuple[int, int]] = {}
+    status = "failed"
+    error_type = None
+    logger.info("Starting silver run %s", run_id)
+    try:
+        for table, rows, rules in outputs:
+            blockers = [_rule_failed(rows, rule) for rule, level in rules if level == "block"]
+            if blockers and rows.filter(reduce(or_, blockers)).limit(1).count():
+                # Save quarantine and the rule result before the writer raises.
+                rows_in = claims.count() + transactions.count()
+                write_silver(table, rows, silver_path, configured_rules=rules, run_id=run_id)
+
+        for table, rows, rules in outputs:
+            results[table] = write_silver(
                 table, rows, silver_path, configured_rules=rules, run_id=run_id
             )
-
-    return {
-        table: write_silver(
-            table, rows, silver_path, configured_rules=rules, run_id=run_id
-        )
-        for table, rows, rules in outputs
-    }
+        quarantined = sum(rejected for _, rejected in results.values())
+        rows_in = sum(accepted + rejected for accepted, rejected in results.values())
+        status = "succeeded"
+        return results
+    except SilverBatchBlocked as error:
+        status = "blocked"
+        error_type = type(error).__name__
+        quarantined = error.rows_quarantined
+        raise
+    except Exception as error:
+        error_type = type(error).__name__
+        logger.error("Silver run %s failed (%s)", run_id, error_type)
+        raise
+    finally:
+        published = sum(accepted for accepted, _ in results.values())
+        duration = perf_counter() - started_clock
+        try:
+            summary = claims.sparkSession.range(1).select(
+                F.lit(run_id).alias("run_id"),
+                F.lit("silver").alias("stage"),
+                F.lit(started_at).alias("started_at"),
+                F.lit(duration).alias("duration_seconds"),
+                F.lit(status).alias("status"),
+                F.lit(rows_in).cast("long").alias("rows_in"),
+                F.lit(published).cast("long").alias("rows_published"),
+                F.lit(quarantined).cast("long").alias("rows_quarantined"),
+                F.lit(error_type).cast("string").alias("error_type"),
+            )
+            summary.write.mode("append").parquet(f"{silver_path}/pipeline_runs")
+        except Exception:
+            if status == "succeeded":
+                raise
+            logger.exception("Could not record silver run %s", run_id)
+        logger.info("Silver run %s ended with status %s after %.2fs", run_id, status, duration)
