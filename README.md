@@ -1,9 +1,91 @@
-# Claims Pipeline
+# Healthcare Claims Data Quality & Observability Platform
 
-A data pipeline that turns synthetic Synthea claims into a weekly payments
-report. PySpark runs in Google Colab, and Snowflake runs the reporting SQL.
+[![Pipeline CI](https://github.com/Bduc07/claims-pipeline/actions/workflows/pytest.yml/badge.svg?branch=ci%2Fpytest-on-push&event=push)](https://github.com/Bduc07/claims-pipeline/actions)
 
-## How to run
+A synthetic healthcare claims pipeline that ingests weekly Synthea
+deliveries, checks data quality, quarantines rejected rows, and reports
+payments by claim week. Airflow schedules local Spark jobs in Docker
+Compose. The original Colab notebook also supports a manual Snowflake
+reporting workflow.
+
+[Demo guide](docs/DEMO.md) ? [Runbook](RUNBOOK.md) ? [Security](SECURITY.md) ? [Sprint notes](docs/SPRINTS.md)
+
+## Architecture
+
+```mermaid
+flowchart LR
+    landing["Synthea weekly CSVs"] --> bronze["Spark bronze Parquet"]
+    bronze --> silver["Spark silver validation"]
+    references["Optional patient, provider, and coverage CSVs"] --> silver
+    yamlRules["YAML quality rules"] --> silver
+    runner["Airflow DAG or command-line runner"] -.-> bronze
+    runner -.-> silver
+    runner -.-> gold
+    bronze --> bronzeRuns["Bronze run records"]
+    silver --> quarantine["Rejected rows"]
+    silver --> silverRuns["Silver run and quality results"]
+    silver --> gold["Local gold Parquet and payments report"]
+    silver -->|"Manual CSV export and upload via Colab"| staging["Snowflake staging"]
+    staging -->|"SQL MERGE"| warehouse["Snowflake gold and payments report"]
+    runner -.->|"Airflow failure callback"| alert["Local JSON alert or optional webhook"]
+```
+
+## Prepare input
+
+Reuse any existing batch folder with a `landing/` subfolder. To generate
+new weekly batches and a matching answer key from a Synthea CSV export, run:
+
+```sh
+python scripts/make_batches.py --src /path/to/synthea/csv --out data --period week --last 52
+```
+
+The generator writes `data/landing/` and `data/answer_key.csv`. Use a fresh
+output directory when generating another delivery. Generated data and
+secrets are Git-ignored.
+
+## Run with Airflow or one command
+
+Docker Compose runs a local Airflow service and Spark. The Airflow DAG
+runs bronze, silver, and local gold in order, retries each failed task
+once, and saves a JSON alert under `data/output/alerts` if the run fails.
+Set `CLAIMS_PIPELINE_ALERT_WEBHOOK` to enable optional Slack-compatible
+notifications. The UI listens on localhost.
+
+1. Put the batch CSVs in `data/landing/`, or set
+   `CLAIMS_PIPELINE_HOST_DATA` to an existing folder with a `landing/`
+   subfolder. Optional inputs are `reference/patients.csv`,
+   `reference/providers.csv`, and `reference/payer_transitions.csv`.
+   Add `expected_files.txt` to require specific filenames before ingestion.
+2. Set `CLAIMS_PIPELINE_HMAC_KEY` using the instructions in SECURITY.md.
+   On Linux, set `AIRFLOW_UID` to your user ID with
+   `export AIRFLOW_UID=$(id -u)` so the container can write to the data folder.
+3. Run `docker compose up --build`. Open `http://localhost:8080`
+   and trigger the `claims_pipeline` DAG. The development login is
+   `admin`, with the generated password stored in the Airflow container
+   at `/opt/airflow/simple_auth_manager_passwords.json.generated`.
+4. Check `output/gold/weekly_payments` inside your data folder for Parquet
+   results. Run `docker compose down` when finished.
+
+Use one runner at a time for a given data folder.
+
+For a one-command run using the same image and data folder:
+
+```sh
+docker compose run --build --rm airflow python -m src.claims_pipeline.pipeline
+```
+
+With Python, Java, and the Spark dependencies installed on Linux, the
+fallback also works directly:
+
+```sh
+python -m src.claims_pipeline.pipeline --data-root data
+```
+
+The local runner produces Parquet gold tables and the weekly payments
+report. Snowflake loading and the warehouse `MERGE` remain a separate
+manual workflow using the silver exports and `sql/gold_pipeline.sql`.
+
+## Original Colab and Snowflake workflow
 
 1. Open `claims_pipeline.ipynb` in Colab and run the cells in order.
    Upload `landing.zip`, then `src/claims_pipeline/bronze.py` when prompted.
@@ -16,6 +98,8 @@ report. PySpark runs in Google Colab, and Snowflake runs the reporting SQL.
    as `SILVER_CLAIMS` and `SILVER_TRANSACTIONS`.
 5. Run the remaining SQL to merge the gold tables and view weekly payments
    by claim batch.
+
+## Data quality and run tracking
 
 The transaction amount rule defaults to `severity: warn`. Invalid rows go
 to quarantine, and the remaining rows are published. With `severity: block`,
@@ -67,9 +151,14 @@ rule in the audit. Its quarantine row keeps the first failure reason.
 
 ## Verified results
 
-- Bronze processed 107 input files.
-- Silver removed 541 duplicate claims and quarantined two invalid records.
-- Gold contains 9,227 claims and 89,459 transactions linked to those claims.
+| Run | Evidence |
+| --- | --- |
+| Original Synthea run in Colab and Snowflake | Bronze read 107 CSVs. Silver removed 541 duplicate claim rows and quarantined one claim and one transaction. Snowflake gold held 9,227 claims and 89,459 linked transactions. |
+| Docker and Airflow CI | Airflow ran bronze, silver, and local gold with a small synthetic delivery. The CLI fallback ran the same delivery and bronze skipped both completed files. The weekly report matched the expected 12.50 total. [Verified run](https://github.com/Bduc07/claims-pipeline/actions/runs/44560630335) |
+
+The original Snowflake counts predate the later keyed masking and
+optional reference inputs. The final Docker check uses its own
+synthetic fixtures.
 
 ## Automated tests
 
@@ -98,47 +187,19 @@ Silver requires a keyed masking secret. Colab prompts for it in Step 4.
 See [SECURITY.md](SECURITY.md) for field handling, key setup, and the
 Snowflake loader and reporter grants.
 
-## Run with Airflow or one command
+## Design decisions and limits
 
-Docker Compose runs a local Airflow service and Spark. The Airflow DAG
-runs bronze, silver, and local gold in order, retries each failed task
-once, and saves a JSON alert under `data/output/alerts` if the run fails.
-Set `CLAIMS_PIPELINE_ALERT_WEBHOOK` to enable optional Slack-compatible
-notifications. The UI listens on localhost.
-
-1. Put the batch CSVs in `data/landing/`, or set
-   `CLAIMS_PIPELINE_HOST_DATA` to an existing folder with a `landing/`
-   subfolder. Optional inputs are `reference/patients.csv`,
-   `reference/providers.csv`, and `reference/payer_transitions.csv`.
-   Add `expected_files.txt` to require specific filenames before ingestion.
-2. Set `CLAIMS_PIPELINE_HMAC_KEY` using the instructions in SECURITY.md.
-   On Linux, set `AIRFLOW_UID` to your user ID with
-   `export AIRFLOW_UID=$(id -u)` so the container can write to the data folder.
-3. Run `docker compose up --build`. Open `http://localhost:8080`
-   and trigger the `claims_pipeline` DAG. The development login is
-   `admin`, with the generated password stored in the Airflow container
-   at `/opt/airflow/simple_auth_manager_passwords.json.generated`.
-4. Check `output/gold/weekly_payments` inside your data folder for Parquet
-   results. Run `docker compose down` when finished.
-
-Use one runner at a time for a given data folder.
-
-For a one-command run using the same image and data folder:
-
-```sh
-docker compose run --build --rm airflow python -m src.claims_pipeline.pipeline
-```
-
-With Python, Java, and the Spark dependencies installed on Linux, the
-fallback also works directly:
-
-```sh
-python -m src.claims_pipeline.pipeline --data-root data
-```
-
-The local runner produces Parquet gold tables and the weekly payments
-report. Snowflake loading and the warehouse `MERGE` remain a separate
-manual workflow using the silver exports and `sql/gold_pipeline.sql`.
+- Bronze tracks delivery filenames and completed output markers. Use
+  a fresh output location for a corrected file with the same name.
+- Bronze and silver run history are Parquet tables in the selected data
+  folder. The Docker stack is a development deployment that expects one
+  pipeline runner at a time. It uses local storage and scheduled runs can
+  rebuild the snapshot from the available bronze files.
+- The original Colab-to-Snowflake handoff remains manual. The current
+  Airflow DAG publishes local Parquet gold. The optional failure webhook
+  requires a URL from your environment.
+- The project uses synthetic records. See SECURITY.md for what the
+  security controls demonstrate and the limits of the example.
 
 ### AWS deployment mapping
 
