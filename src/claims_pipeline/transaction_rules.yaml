@@ -1,0 +1,4 @@
+severity: warn
+amount_required_types:
+  - CHARGE
+  - TRANSFERIN

@@ -1,10 +1,19 @@
 import hashlib
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from pyspark.sql import SparkSession
+from pyspark.sql.readwriter import DataFrameWriter
 
-from src.claims_pipeline.silver import clean_claims, clean_transactions, write_silver
+from src.claims_pipeline.rules import TransactionRuleSettings
+from src.claims_pipeline.silver import (
+    TRANSACTION_AMOUNT_RULE,
+    SilverBatchBlocked,
+    clean_claims,
+    clean_transactions,
+    write_silver,
+)
 
 
 @pytest.fixture(scope="module")
@@ -49,7 +58,16 @@ def test_silver_transactions(spark, tmp_path):
         ],
         "ID string, PATIENTID string, TYPE string, AMOUNT string",
     )
-    assert write_silver("transactions", clean_transactions(transactions), tmp_path) == (3, 2)
+    rules_path = Path(__file__).resolve().parents[1] / "src/claims_pipeline/transaction_rules.yaml"
+    settings = TransactionRuleSettings.from_yaml(rules_path)
+    checked = clean_transactions(transactions, settings)
+    assert write_silver(
+        "transactions",
+        checked,
+        tmp_path,
+        severity=settings.severity,
+        report_rule=TRANSACTION_AMOUNT_RULE,
+    ) == (3, 2)
     valid = spark.read.parquet(str(tmp_path / "transactions")).collect()
     invalid = spark.read.parquet(str(tmp_path / "quarantine" / "transactions")).collect()
     assert {row.ID: row.amount_decimal for row in valid} == {
@@ -64,3 +82,67 @@ def test_silver_transactions(spark, tmp_path):
     assert {row.PATIENTID for row in valid + invalid} == {
         hashlib.sha256(b"patient-1").hexdigest()
     }
+    [result] = spark.read.parquet(str(tmp_path / "dq_results")).collect()
+    assert (result.rule_name, result.severity) == (TRANSACTION_AMOUNT_RULE, "warn")
+    assert (result.rows_checked, result.rows_failed, result.result) == (5, 2, "warned")
+
+
+def test_transaction_amount_requirement_follows_yaml(spark, tmp_path):
+    path = tmp_path / "rules.yaml"
+    path.write_text("amount_required_types:\n  - PAYMENT\n", encoding="utf-8")
+    settings = TransactionRuleSettings.from_yaml(path)
+    rows = spark.sql("""
+        SELECT * FROM VALUES ('CHARGE', NULL), ('PAYMENT', NULL)
+        AS transactions (TYPE, AMOUNT)
+    """)
+    reasons = {
+        row.TYPE: row.quarantine_reason
+        for row in clean_transactions(rows, settings).select("TYPE", "quarantine_reason").collect()
+    }
+    assert reasons == {"CHARGE": None, "PAYMENT": "invalid_or_missing_amount"}
+
+
+def test_empty_required_types_config_is_invalid(tmp_path):
+    path = tmp_path / "rules.yaml"
+    path.write_text("amount_required_types: []\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="nonempty list"):
+        TransactionRuleSettings.from_yaml(path)
+
+
+def test_invalid_severity_is_rejected(tmp_path):
+    path = tmp_path / "rules.yaml"
+    path.write_text("severity: stop\namount_required_types: [CHARGE]\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="severity must be warn or block"):
+        TransactionRuleSettings.from_yaml(path)
+
+
+def test_block_writes_quarantine_without_publishing_silver(spark, tmp_path, monkeypatch, caplog):
+    path = tmp_path / "rules.yaml"
+    path.write_text("severity: block\namount_required_types: [CHARGE]\n", encoding="utf-8")
+    settings = TransactionRuleSettings.from_yaml(path)
+    rows = spark.sql("""
+        SELECT * FROM VALUES ('patient-1', 'CHARGE', 'INVALID'), ('patient-2', 'CHARGE', '1.00')
+        AS transactions (PATIENTID, TYPE, AMOUNT)
+    """)
+    checked = clean_transactions(rows, settings)
+    writes = []
+    def capture_write(writer, destination):
+        target = Path(destination)
+        writes.append(target)
+        if target.name == "dq_results":
+            [result] = writer._df.collect()
+            assert (result.rows_checked, result.rows_failed, result.result) == (2, 1, "blocked")
+
+    monkeypatch.setattr(DataFrameWriter, "parquet", capture_write)
+
+    with pytest.raises(SilverBatchBlocked, match="1 row"):
+        write_silver(
+            "transactions",
+            checked,
+            tmp_path,
+            severity=settings.severity,
+            report_rule=TRANSACTION_AMOUNT_RULE,
+        )
+
+    assert writes == [tmp_path / "quarantine" / "transactions", tmp_path / "dq_results"]
+    assert "Silver batch blocked for transactions" in caplog.text

@@ -6,7 +6,9 @@ report. PySpark runs in Google Colab, and Snowflake runs the reporting SQL.
 ## How to run
 
 1. Open `claims_pipeline.ipynb` in Colab and run the cells in order.
-   Upload `landing.zip`, then upload `src/silver.py` when prompted.
+   Upload `landing.zip`, then `src/claims_pipeline/bronze.py` when prompted.
+   At Step 4, upload `silver.py`, `rules.py`, and `transaction_rules.yaml` from
+   `src/claims_pipeline/` when prompted.
    The notebook writes bronze and silver Parquet files.
 2. Run the silver checks in Colab. Expect three passing checks for the supplied batch.
 3. Run the database and schema setup at the top of `sql/gold_pipeline.sql`.
@@ -14,6 +16,16 @@ report. PySpark runs in Google Colab, and Snowflake runs the reporting SQL.
    as `SILVER_CLAIMS` and `SILVER_TRANSACTIONS`.
 5. Run the remaining SQL to merge the gold tables and view weekly payments
    by claim batch.
+
+The transaction amount rule defaults to `severity: warn`. Invalid rows go
+to quarantine, and the remaining rows are published. With `severity: block`,
+the notebook writes transaction quarantine and stops before publishing new
+silver outputs if the rule fails.
+
+Step 5 shows the latest transaction rule result from the append-only
+`/content/silver/dq_results` Parquet table. After a blocked run, you can
+still run that result cell by itself. The table lasts for the current
+Colab runtime.
 
 ## Verified results
 
@@ -28,6 +40,6 @@ Python 3.12, Java 17, and small synthetic Spark fixtures. With Python and Java
 installed, run the same tests locally:
 
 ```sh
-python -m pip install "pyspark==4.0.1" "pytest>=8,<10"
+python -m pip install "pyspark==4.0.1" "pytest>=8,<10" "PyYAML>=6,<7"
 python -m pytest -q
 ```
