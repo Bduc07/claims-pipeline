@@ -21,6 +21,9 @@ The transaction amount rule defaults to `severity: warn`. Invalid rows go
 to quarantine, and the remaining rows are published. With `severity: block`,
 the notebook writes transaction quarantine and stops before publishing new
 silver outputs if the rule fails.
+The `charge_minimum` setting in `transaction_rules.yaml` defaults to
+`0.00`. Charges below it go to quarantine. Payment and transfer amounts
+are outside this range check.
 
 The missing claim ID rule uses `claim_rules.yaml`. It defaults to `warn`
 in Colab. To try `block`, put the edited file in

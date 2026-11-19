@@ -1,6 +1,7 @@
 """Apply named row-level data quality checks to Spark DataFrames."""
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Literal
 
@@ -39,6 +40,7 @@ class ClaimRuleSettings:
 class TransactionRuleSettings:
     amount_required_types: tuple[str, ...]
     severity: Severity = "warn"
+    charge_minimum: Decimal = Decimal("0.00")
 
     @classmethod
     def from_yaml(cls, path: Path) -> "TransactionRuleSettings":
@@ -47,9 +49,9 @@ class TransactionRuleSettings:
         if (
             not isinstance(document, dict)
             or "amount_required_types" not in document
-            or set(document) - {"amount_required_types", "severity"}
+            or set(document) - {"amount_required_types", "severity", "charge_minimum"}
         ):
-            raise ValueError("Expected amount_required_types and optional severity settings.")
+            raise ValueError("Expected amount_required_types, with optional severity and charge_minimum.")
         types = document["amount_required_types"]
         if (
             not isinstance(types, list)
@@ -57,7 +59,16 @@ class TransactionRuleSettings:
             or any(not isinstance(value, str) or not value.strip() for value in types)
         ):
             raise ValueError("amount_required_types must be a nonempty list of transaction types.")
-        return cls(tuple(types), _severity(document.get("severity", "warn")))
+        try:
+            minimum = Decimal(str(document.get("charge_minimum", "0.00")))
+        except InvalidOperation as error:
+            raise ValueError("charge_minimum must be a decimal amount.") from error
+        if not minimum.is_finite() or (
+            not -Decimal("9999999999999999.99") <= minimum <= Decimal("9999999999999999.99")
+            or minimum.as_tuple().exponent < -2
+        ):
+            raise ValueError("charge_minimum must fit DECIMAL(18, 2).")
+        return cls(tuple(types), _severity(document.get("severity", "warn")), minimum)
 
 
 @dataclass(frozen=True)

@@ -98,7 +98,12 @@ def clean_transactions(
         name=TRANSACTION_AMOUNT_RULE,
         fails_when=F.col("amount_decimal").isNull() & (amount_required | amount_present),
     )
-    return RuleEngine((amount_rule,)).annotate(parsed)
+    charge_minimum_rule = Rule(
+        name="charge_amount_below_minimum",
+        fails_when=(F.col("TYPE") == "CHARGE")
+        & (F.col("amount_decimal") < F.lit(settings.charge_minimum)),
+    )
+    return RuleEngine((amount_rule, charge_minimum_rule)).annotate(parsed)
 
 
 def write_silver(

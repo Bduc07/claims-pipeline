@@ -310,6 +310,52 @@ def test_transaction_amount_requirement_follows_yaml(spark, tmp_path):
     assert reasons == {"CHARGE": None, "PAYMENT": "invalid_or_missing_amount"}
 
 
+@pytest.mark.parametrize(
+    ("minimum", "charge_at_zero"),
+    [("0.00", None), ("1.25", "charge_amount_below_minimum")],
+)
+def test_charge_minimum_follows_yaml(spark, tmp_path, minimum, charge_at_zero):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        f'amount_required_types: [CHARGE, TRANSFERIN]\ncharge_minimum: "{minimum}"\n',
+        encoding="utf-8",
+    )
+    settings = TransactionRuleSettings.from_yaml(path)
+    rows = spark.sql("""
+        SELECT * FROM VALUES
+            ('below', 'CHARGE', '-5.00'),
+            ('zero', 'CHARGE', '0.00'),
+            ('above', 'CHARGE', '1.25'),
+            ('payment', 'PAYMENT', '-5.00'),
+            ('transfer', 'TRANSFERIN', '-5.00'),
+            ('malformed', 'CHARGE', 'INVALID')
+        AS transactions (ID, TYPE, AMOUNT)
+    """)
+    actual = {
+        row.ID: row.quarantine_reason
+        for row in clean_transactions(rows, settings).select("ID", "quarantine_reason").collect()
+    }
+    assert actual == {
+        "below": "charge_amount_below_minimum",
+        "zero": charge_at_zero,
+        "above": None,
+        "payment": None,
+        "transfer": None,
+        "malformed": TRANSACTION_AMOUNT_RULE,
+    }
+
+
+@pytest.mark.parametrize("minimum", ["bad", "NaN", "0.001", "10000000000000000.00"])
+def test_unusable_charge_minimum_is_rejected(tmp_path, minimum):
+    path = tmp_path / "rules.yaml"
+    path.write_text(
+        f'amount_required_types: [CHARGE]\ncharge_minimum: "{minimum}"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="charge_minimum"):
+        TransactionRuleSettings.from_yaml(path)
+
+
 def test_empty_required_types_config_is_invalid(tmp_path):
     path = tmp_path / "rules.yaml"
     path.write_text("amount_required_types: []\n", encoding="utf-8")
