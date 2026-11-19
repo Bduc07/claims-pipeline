@@ -1,6 +1,8 @@
 """Validate bronze records and write silver and quarantine Parquet tables."""
 
+import hmac
 import logging
+import os
 from datetime import UTC, datetime
 from functools import reduce
 from operator import or_
@@ -26,6 +28,7 @@ logger = logging.getLogger(__name__)
 TRANSACTION_AMOUNT_RULE = "invalid_or_missing_amount"
 CHARGE_MINIMUM_RULE = "charge_amount_below_minimum"
 MISSING_CLAIM_ID_RULE = "missing_claim_id"
+PATIENT_KEY_ENV = "CLAIMS_PIPELINE_HMAC_KEY"
 
 
 class SilverBatchBlocked(RuntimeError):
@@ -115,6 +118,23 @@ def _rule_failed(checked: DataFrame, rule: str) -> Column:
     return F.col("quarantine_reason") == rule
 
 
+def mask_patient_fields(rows: DataFrame) -> DataFrame:
+    """Pseudonymize patient IDs and remove member IDs and free-text notes."""
+    key = os.environ.get(PATIENT_KEY_ENV, "").encode("utf-8")
+    if len(key) < 32:
+        raise ValueError(f"{PATIENT_KEY_ENV} must contain a secret of at least 32 bytes.")
+
+    def patient_token(patient_id: str | None) -> str | None:
+        if patient_id is None:
+            return None
+        return hmac.digest(key, patient_id.encode("utf-8"), "sha256").hex()
+
+    tokenize = F.udf(patient_token, "string")
+    return rows.drop("PATIENTINSURANCEID", "NOTES", "LINENOTE").withColumn(
+        "PATIENTID", tokenize(F.col("PATIENTID"))
+    )
+
+
 def write_silver(
     table: str,
     checked: DataFrame,
@@ -126,9 +146,7 @@ def write_silver(
     configured_rules: tuple[tuple[str, Severity], ...] = (),
     run_id: str | None = None,
 ) -> tuple[int, int]:
-    masked = checked.drop(*(f"_dq_{rule}" for rule in CLAIM_RULE_NAMES)).withColumn(
-        "PATIENTID", F.sha2(F.col("PATIENTID"), 256)
-    )
+    masked = mask_patient_fields(checked.drop(*(f"_dq_{rule}" for rule in CLAIM_RULE_NAMES)))
     valid = masked.filter(F.col("quarantine_reason").isNull()).drop("quarantine_reason")
     invalid = masked.filter(F.col("quarantine_reason").isNotNull())
     reports = [*configured_rules, *((rule, "warn") for rule in warning_rules)]

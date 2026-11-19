@@ -91,3 +91,9 @@ outcomes, and Snowflake provides query history for gold.
 
 See [the runbook](RUNBOOK.md) for recovery steps and [the incident notes](docs/incidents/)
 for the schema change, late file, and corrupted batch drills.
+
+## Security
+
+Silver requires a keyed masking secret. Colab prompts for it in Step 4.
+See [SECURITY.md](SECURITY.md) for field handling, key setup, and the
+Snowflake loader and reporter grants.

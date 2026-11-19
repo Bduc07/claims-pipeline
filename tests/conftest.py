@@ -1,7 +1,15 @@
 from collections.abc import Iterator
+from secrets import token_hex
 
 import pytest
 from pyspark.sql import SparkSession
+
+
+@pytest.fixture(autouse=True)
+def masking_key(monkeypatch: pytest.MonkeyPatch) -> bytes:
+    secret = token_hex(32)
+    monkeypatch.setenv("CLAIMS_PIPELINE_HMAC_KEY", secret)
+    return secret.encode("utf-8")
 
 
 @pytest.fixture(scope="module")

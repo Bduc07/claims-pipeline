@@ -1,5 +1,5 @@
 import csv
-import hashlib
+import hmac
 from decimal import Decimal
 from pathlib import Path
 
@@ -10,16 +10,18 @@ from pyspark.sql.readwriter import DataFrameWriter
 from src.claims_pipeline.rules import ClaimRuleSettings, TransactionRuleSettings
 from src.claims_pipeline.silver import (
     CHARGE_MINIMUM_RULE,
+    PATIENT_KEY_ENV,
     TRANSACTION_AMOUNT_RULE,
     SilverBatchBlocked,
     clean_claims,
     clean_transactions,
+    mask_patient_fields,
     write_silver,
     write_silver_batch,
 )
 
 
-def test_silver_claims(spark, tmp_path):
+def test_silver_claims(spark, tmp_path, masking_key):
     claims = spark.createDataFrame(
         [
             ("claim-1", "patient-1", "CLOSED", "claims_week.csv"),
@@ -33,9 +35,35 @@ def test_silver_claims(spark, tmp_path):
     [invalid] = spark.read.parquet(str(tmp_path / "quarantine" / "claims")).collect()
     assert valid.Id == "claim-1"
     assert valid.source_file == "claims_week.csv"
-    assert valid.PATIENTID == hashlib.sha256(b"patient-1").hexdigest()
+    assert valid.PATIENTID == hmac.digest(masking_key, b"patient-1", "sha256").hex()
     assert invalid.PATIENTID == valid.PATIENTID
     assert (invalid.Id, invalid.quarantine_reason) == ("claim-2", "invalid_claim_status")
+
+
+def test_patient_masking_removes_sensitive_fields_and_supports_rotation(
+    spark, masking_key, monkeypatch
+):
+    rows = spark.sql("""
+        SELECT 'patient-1' AS PATIENTID, 'member-1' AS PATIENTINSURANCEID,
+            'sensitive notes' AS NOTES, 'sensitive line note' AS LINENOTE
+        UNION ALL SELECT NULL, 'member-2', 'another note', 'another line note'
+    """)
+    masked = mask_patient_fields(rows)
+    assert masked.columns == ["PATIENTID"]
+    tokens = {row.PATIENTID for row in masked.collect()}
+    assert tokens == {None, hmac.digest(masking_key, b"patient-1", "sha256").hex()}
+    assert {row.PATIENTID for row in mask_patient_fields(rows).collect()} == tokens
+
+    monkeypatch.setenv(PATIENT_KEY_ENV, masking_key.decode("utf-8") + "-rotated")
+    rotated = {row.PATIENTID for row in mask_patient_fields(rows).collect()}
+    assert tokens & rotated == {None}
+
+
+def test_silver_rejects_an_unconfigured_masking_key(spark, monkeypatch):
+    monkeypatch.delenv(PATIENT_KEY_ENV)
+    rows = spark.sql("SELECT 'patient-1' AS PATIENTID")
+    with pytest.raises(ValueError, match=PATIENT_KEY_ENV):
+        mask_patient_fields(rows)
 
 
 def test_bronze_rows_reconcile_with_silver(spark):
@@ -331,7 +359,7 @@ def test_claim_eligibility_checks_date_and_primary_payer(spark):
     }
 
 
-def test_silver_transactions(spark, tmp_path):
+def test_silver_transactions(spark, tmp_path, masking_key):
     transactions = spark.createDataFrame(
         [
             ("charge", "patient-1", "CHARGE", "12.34"),
@@ -365,7 +393,7 @@ def test_silver_transactions(spark, tmp_path):
         "malformed": "invalid_or_missing_amount",
     }
     assert {row.PATIENTID for row in valid + invalid} == {
-        hashlib.sha256(b"patient-1").hexdigest()
+        hmac.digest(masking_key, b"patient-1", "sha256").hex()
     }
     audit = spark.read.parquet(str(tmp_path / "dq_results")).collect()
     assert len(audit) == 2
