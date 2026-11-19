@@ -4,7 +4,7 @@ from decimal import Decimal
 import pytest
 from pyspark.sql import SparkSession
 
-from src.silver import clean_claims, clean_transactions, write_silver
+from src.claims_pipeline.silver import clean_claims, clean_transactions, write_silver
 
 
 @pytest.fixture(scope="module")
