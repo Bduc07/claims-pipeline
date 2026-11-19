@@ -1,0 +1,66 @@
+name: PySpark tests
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+      - run: python -m pip install "pyspark==4.0.1" "pytest>=8,<10" "PyYAML>=6,<7" ruff
+      - run: python -m ruff check src tests dags scripts
+      - run: python -m pytest -q
+
+  airflow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - name: Prepare synthetic delivery
+        run: |
+          mkdir -p data/landing data/output
+          chmod a+w data/output
+          cat >data/landing/claims_2026-01-05.csv <<'CSV'
+          Id,PATIENTID,PROVIDERID,SERVICEDATE,STATUS1
+          c1,p1,provider1,2026-01-05,CLOSED
+          CSV
+          cat >data/landing/transactions_2026-01-05.csv <<'CSV'
+          ID,CLAIMID,PATIENTID,TYPE,AMOUNT,PAYMENTS
+          t1,c1,p1,PAYMENT,,12.50
+          t2,orphan,p2,CHARGE,10.00,0.00
+          CSV
+          printf '%s\n' claims_2026-01-05.csv transactions_2026-01-05.csv > data/expected_files.txt
+      - name: Build the Airflow and Spark image
+        run: docker compose build
+      - name: Run the Airflow DAG and CLI fallback
+        run: |
+          export CLAIMS_PIPELINE_HMAC_KEY="$(openssl rand -hex 32)"
+          docker compose run --rm -T airflow bash -ec '
+            airflow db migrate
+            airflow dags test claims_pipeline 2026-01-05T00:00:00+00:00
+            python -m src.claims_pipeline.pipeline
+            python -c "
+          from decimal import Decimal
+          from src.claims_pipeline.pipeline import create_spark
+          spark = create_spark()
+          try:
+              rows = spark.read.parquet(\"/opt/airflow/data/output/gold/weekly_payments\").collect()
+              assert len(rows) == 1, rows
+              assert tuple(rows[0]) == (\"2026-01-05\", 1, Decimal(\"12.50\")), rows
+              bronze = spark.read.parquet(\"/opt/airflow/data/output/bronze/pipeline_runs\")
+              assert sorted(row.files_written for row in bronze.collect()) == [0, 2]
+          finally:
+              spark.stop()
+          "
+          '

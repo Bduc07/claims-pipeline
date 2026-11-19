@@ -1,0 +1,5 @@
+severity: warn
+charge_minimum: "0.00"
+amount_required_types:
+  - CHARGE
+  - TRANSFERIN
