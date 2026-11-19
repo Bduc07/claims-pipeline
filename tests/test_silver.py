@@ -492,12 +492,19 @@ def test_pipeline_runs_persists_success_and_block(spark, tmp_path):
     block = TransactionRuleSettings(("CHARGE",), "block")
     with pytest.raises(SilverBatchBlocked):
         write_silver_batch(claims, checked, tmp_path, claim_rules, block)
+    corrected = transactions.withColumn(
+        "AMOUNT", F.when(F.col("AMOUNT") == "INVALID", F.lit("15.00")).otherwise(F.col("AMOUNT"))
+    )
+    assert write_silver_batch(
+        claims, clean_transactions(corrected, block), tmp_path, claim_rules, block
+    )["transactions"] == (2, 0)
 
-    runs = spark.read.parquet(str(tmp_path / "pipeline_runs")).collect()
-    assert len(runs) == 2
-    assert {
-        row.status: (row.rows_in, row.rows_published, row.rows_quarantined) for row in runs
-    } == {"succeeded": (3, 2, 1), "blocked": (3, 0, 1)}
+    runs = spark.read.parquet(str(tmp_path / "pipeline_runs")).orderBy("started_at").collect()
+    assert [(row.status, row.rows_in, row.rows_published, row.rows_quarantined) for row in runs] == [
+        ("succeeded", 3, 2, 1),
+        ("blocked", 3, 0, 1),
+        ("succeeded", 3, 3, 0),
+    ]
     audit = spark.read.parquet(str(tmp_path / "dq_results")).select("run_id").distinct().collect()
     assert {row.run_id for row in runs} == {row.run_id for row in audit}
 

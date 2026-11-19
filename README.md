@@ -81,3 +81,13 @@ installed, run the same tests locally:
 python -m pip install "pyspark==4.0.1" "pytest>=8,<10" "PyYAML>=6,<7"
 python -m pytest -q
 ```
+
+## Production support
+
+Bronze appends file counts, timing, and status to `bronze/pipeline_runs`.
+Supply `expected_files` to `run_bronze` to reject a partial delivery
+before writing new bronze files. Silver records row counts and quality
+outcomes, and Snowflake provides query history for gold.
+
+See [the runbook](RUNBOOK.md) for recovery steps and [the incident notes](docs/incidents/)
+for the schema change, late file, and corrupted batch drills.
