@@ -37,6 +37,8 @@ To apply the optional eligibility rule in a Spark job, pass the Synthea
 The rule matches patient and primary payer on the service date. Both dates
 are inclusive, a blank coverage end is open-ended, and claims without a
 primary payer skip this check.
+Silver quarantines missing or invalid service dates even when the optional
+coverage check is disabled.
 
 Pass the Synthea `patients.csv` and `providers.csv` DataFrames as
 `patients` and `providers` to `clean_claims` to enable reference checks.

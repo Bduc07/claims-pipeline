@@ -4,6 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import pytest
+from pyspark.sql import functions as F
 from pyspark.sql.readwriter import DataFrameWriter
 
 from src.claims_pipeline.rules import ClaimRuleSettings, TransactionRuleSettings
@@ -25,7 +26,7 @@ def test_silver_claims(spark, tmp_path):
             ("claim-2", "patient-1", "UNKNOWN", "claims_week.csv"),
         ],
         "Id string, PATIENTID string, STATUS1 string, source_file string",
-    )
+    ).withColumn("SERVICEDATE", F.lit("2026-01-05"))
     assert write_silver("claims", clean_claims(claims), tmp_path) == (1, 1)
     [valid] = spark.read.parquet(str(tmp_path / "claims")).collect()
     [invalid] = spark.read.parquet(str(tmp_path / "quarantine" / "claims")).collect()
@@ -38,7 +39,7 @@ def test_silver_claims(spark, tmp_path):
 
 def test_bronze_rows_reconcile_with_silver(spark):
     claims = spark.sql("""
-        SELECT * FROM VALUES
+        SELECT *, '2026-01-05' AS SERVICEDATE FROM VALUES
             ('claim-1', 'CLOSED', 'claims_week.csv'),
             ('claim-1', 'CLOSED', 'claims_week_resend.csv'),
             ('claim-2', 'UNKNOWN', 'claims_week.csv')
@@ -85,7 +86,7 @@ def test_quarantine_matches_answer_key(spark, tmp_path):
         )
 
     claims = spark.sql("""
-        SELECT *, 'claims_2026-01-05.csv' AS source_file FROM VALUES
+        SELECT *, 'claims_2026-01-05.csv' AS source_file, '2026-01-05' AS SERVICEDATE FROM VALUES
             ('claim-1', 'CLOSED'), ('claim-2', 'UNKNOWN')
         AS claims (Id, STATUS1)
     """)
@@ -109,7 +110,7 @@ def test_quarantine_matches_answer_key(spark, tmp_path):
 
 def test_missing_claim_ids_are_preserved_before_deduplication(spark):
     claims = spark.sql("""
-        SELECT *, 'claims_week.csv' AS source_file FROM VALUES
+        SELECT *, 'claims_week.csv' AS source_file, '2026-01-05' AS SERVICEDATE FROM VALUES
             ('claim-1', 'CLOSED'),
             (NULL, 'CLOSED'),
             (NULL, 'UNKNOWN'),
@@ -131,7 +132,8 @@ def test_missing_claim_id_severity_controls_publication(spark, tmp_path, monkeyp
     config = tmp_path / "claim_rules.yaml"
     config.write_text(f"missing_claim_id:\n  severity: {severity}\n", encoding="utf-8")
     claims = spark.sql("""
-        SELECT *, 'claims_week.csv' AS source_file, 'patient-1' AS PATIENTID
+        SELECT *, 'claims_week.csv' AS source_file, 'patient-1' AS PATIENTID,
+            '2026-01-05' AS SERVICEDATE
         FROM VALUES
             ('claim-1', 'CLOSED'), (NULL, 'CLOSED'), (NULL, 'CLOSED'),
             ('', 'CLOSED'), ('   ', 'CLOSED')
@@ -161,7 +163,7 @@ def test_missing_claim_id_severity_controls_publication(spark, tmp_path, monkeyp
 
 def test_claim_patient_and_provider_references(spark):
     claims = spark.sql("""
-        SELECT *, 'claims_week.csv' AS source_file FROM VALUES
+        SELECT *, 'claims_week.csv' AS source_file, '2026-01-05' AS SERVICEDATE FROM VALUES
             ('known', 'patient-1', 'provider-1', 'CLOSED'),
             ('bad-patient', 'patient-2', 'provider-1', 'CLOSED'),
             ('bad-provider', 'patient-1', 'provider-2', 'CLOSED'),
@@ -185,6 +187,34 @@ def test_claim_patient_and_provider_references(spark):
         "missing-provider": "unknown_provider",
         "blank-provider": "unknown_provider",
         "bad-status": "invalid_claim_status",
+    }
+
+
+def test_invalid_service_dates_are_flagged_before_eligibility(spark):
+    claims = spark.sql("""
+        SELECT *, 'claims_week.csv' AS source_file, 'CLOSED' AS STATUS1,
+            'patient-1' AS PATIENTID, 'payer-a' AS PRIMARYPATIENTINSURANCEID
+        FROM VALUES
+            ('valid', '2026-02-10T10:00:00Z'), ('date-only', '2026-02-10'),
+            ('blank', '  '), ('missing', NULL), ('impossible', '2026-02-30'),
+            ('partial', '2026-02')
+        AS claims (Id, SERVICEDATE)
+    """)
+    coverage = spark.sql("""
+        SELECT 'patient-1' AS PATIENT, 'payer-a' AS PAYER,
+            '2026-02-01' AS START_DATE, '2026-02-28' AS END_DATE
+    """)
+    actual = {
+        row.Id: row.quarantine_reason
+        for row in clean_claims(claims, coverage).select("Id", "quarantine_reason").collect()
+    }
+    assert actual == {
+        "valid": None,
+        "date-only": None,
+        "blank": "invalid_service_date",
+        "missing": "invalid_service_date",
+        "impossible": "invalid_service_date",
+        "partial": "invalid_service_date",
     }
 
 

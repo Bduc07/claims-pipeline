@@ -63,13 +63,16 @@ def clean_claims(
         F.col("source_file").endswith("_resend.csv").cast("int"),
         F.col("source_file"),
     )
+    date_shape = F.col("SERVICEDATE").cast("string").rlike(r"^\d{4}-\d{2}-\d{2}(?:[T ].+)?$")
+    invalid_date = ~date_shape | F.expr("try_cast(SERVICEDATE AS TIMESTAMP)").isNull()
     checked = (
         claims.filter(~missing_id).withColumn("_rank", F.row_number().over(order))
         .filter(F.col("_rank") == 1)
         .drop("_rank")
         .withColumn(
             "quarantine_reason",
-            F.when(F.col("STATUS1") == "UNKNOWN", F.lit("invalid_claim_status")),
+            F.when(F.col("STATUS1") == "UNKNOWN", F.lit("invalid_claim_status"))
+            .when(invalid_date, F.lit("invalid_service_date")),
         )
     )
     if patients is not None:
