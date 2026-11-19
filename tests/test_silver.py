@@ -100,6 +100,35 @@ def test_missing_claim_id_severity_controls_publication(spark, tmp_path, monkeyp
         assert tmp_path / "transactions" in writes
 
 
+def test_claim_patient_and_provider_references(spark):
+    claims = spark.sql("""
+        SELECT *, 'claims_week.csv' AS source_file FROM VALUES
+            ('known', 'patient-1', 'provider-1', 'CLOSED'),
+            ('bad-patient', 'patient-2', 'provider-1', 'CLOSED'),
+            ('bad-provider', 'patient-1', 'provider-2', 'CLOSED'),
+            ('missing-provider', 'patient-1', NULL, 'CLOSED'),
+            ('blank-provider', 'patient-1', '', 'CLOSED'),
+            ('bad-status', 'patient-2', 'provider-2', 'UNKNOWN')
+        AS claims (Id, PATIENTID, PROVIDERID, STATUS1)
+    """)
+    patients = spark.sql("SELECT 'patient-1' AS Id")
+    providers = spark.sql("""
+        SELECT * FROM VALUES ('provider-1'), ('provider-1'), ('') AS providers (Id)
+    """)
+
+    checked = clean_claims(claims, patients=patients, providers=providers)
+    actual = checked.select("Id", "quarantine_reason").collect()
+    assert len(actual) == 6
+    assert {row.Id: row.quarantine_reason for row in actual} == {
+        "known": None,
+        "bad-patient": "unknown_patient",
+        "bad-provider": "unknown_provider",
+        "missing-provider": "unknown_provider",
+        "blank-provider": "unknown_provider",
+        "bad-status": "invalid_claim_status",
+    }
+
+
 def test_claim_eligibility_checks_date_and_primary_payer(spark):
     claims = spark.sql("""
         SELECT *, 'claims_week.csv' AS source_file FROM VALUES

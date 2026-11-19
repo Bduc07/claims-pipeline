@@ -25,7 +25,36 @@ class SilverBatchBlocked(RuntimeError):
     """A blocking quality rule rejected this silver batch."""
 
 
-def clean_claims(claims: DataFrame, coverage: DataFrame | None = None) -> DataFrame:
+def _check_reference(
+    claims: DataFrame, reference: DataFrame, claim_key: str, reason: str
+) -> DataFrame:
+    keys = (
+        reference.select(F.col("Id").alias("_reference_id"))
+        .filter(~F.col("_reference_id").rlike(r"^\s*$"))
+        .distinct()
+    )
+    return (
+        claims.join(
+            keys, F.col(claim_key) == F.col("_reference_id"), how="left"
+        )
+        .withColumn(
+            "quarantine_reason",
+            F.coalesce(
+                F.col("quarantine_reason"),
+                F.when(F.col("_reference_id").isNull(), F.lit(reason)),
+            ),
+        )
+        .drop("_reference_id")
+    )
+
+
+def clean_claims(
+    claims: DataFrame,
+    coverage: DataFrame | None = None,
+    *,
+    patients: DataFrame | None = None,
+    providers: DataFrame | None = None,
+) -> DataFrame:
     missing_id = F.coalesce(F.col("Id"), F.lit("")).rlike(r"^\s*$")
     rejected = claims.filter(missing_id).withColumn(
         "quarantine_reason", F.lit(MISSING_CLAIM_ID_RULE)
@@ -43,6 +72,10 @@ def clean_claims(claims: DataFrame, coverage: DataFrame | None = None) -> DataFr
             F.when(F.col("STATUS1") == "UNKNOWN", F.lit("invalid_claim_status")),
         )
     )
+    if patients is not None:
+        checked = _check_reference(checked, patients, "PATIENTID", "unknown_patient")
+    if providers is not None:
+        checked = _check_reference(checked, providers, "PROVIDERID", "unknown_provider")
     if coverage is not None:
         from .eligibility import flag_uncovered_claims
 

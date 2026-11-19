@@ -38,6 +38,13 @@ The rule matches patient and primary payer on the service date. Both dates
 are inclusive, a blank coverage end is open-ended, and claims without a
 primary payer skip this check.
 
+Pass the Synthea `patients.csv` and `providers.csv` DataFrames as
+`patients` and `providers` to `clean_claims` to enable reference checks.
+The checks compare the patient and provider IDs on each claim to the
+reference tables before patient IDs
+are hashed. Claims with missing or unrecognized patient or provider
+references go to quarantine when the corresponding check is enabled.
+
 ## Verified results
 
 - Bronze processed 107 input files.
